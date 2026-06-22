@@ -7,6 +7,7 @@
 #include <map>
 #include <queue>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -297,6 +298,7 @@ struct FullBlockPlacement {
 struct FullPlacementResult {
     vector<FullBlockPlacement> placements; // same index as blocks
     vector<int> placement_order;
+    string strategy_name;
     vector<string> warnings;
     vector<string> errors;
 };
@@ -816,15 +818,14 @@ static vector<Rect> generateInteriorPlacementCandidates(const string &name,
                                                          double h,
                                                          double outlineW,
                                                          double outlineH,
-                                                         const vector<Rect> &placed) {
+                                                         const vector<Rect> &placed,
+                                                         double routingGap = 20.0) {
     vector<Rect> candidates;
     if (w <= 0.0 || h <= 0.0 || w > outlineW + EPS || h > outlineH + EPS) return candidates;
 
-    // Keep a small whitespace moat around every non-edge block placement.
-    // This makes the generated channel graph much less likely to contain isolated pockets.
-    // The value is intentionally small compared with testcase dimensions, but positive enough
-    // to create legal channel rectangles and block-channel adjacency.
-    const double routingGap = 20.0;
+    // Keep a whitespace moat around every non-edge block placement.
+    // Step 13 can pass a larger demand-aware gap for high-traffic blocks.
+    routingGap = max(0.0, routingGap);
     double loX = routingGap;
     double loY = routingGap;
     double hiX = outlineW - w - routingGap;
@@ -922,12 +923,63 @@ static double candidateConnectivityScore(const InputData &d, int idx, const Rect
     return score;
 }
 
-static FullPlacementResult placeAllBlocksAfterEdges(const InputData &d, const ShapeResult &sr, const EdgePlacementResult &er) {
+
+struct PlacementStrategyConfig {
+    string name = "BASELINE_PLACEMENT";
+    bool demand_aware = false;
+    double base_gap = 20.0;
+    double extra_gap = 0.0;
+    double connectivity_weight = 1.0;
+    double center_weight = 0.0;
+    double compact_weight = 1.0;
+};
+
+static double totalBlockDemand(const InputData &d, int idx) {
+    double demand = 0.0;
+    for (size_t j = 0; j < d.blocks.size(); ++j) {
+        if (idx == static_cast<int>(j)) continue;
+        if (idx < static_cast<int>(d.conn.size()) && j < d.conn[idx].size()) demand += d.conn[idx][j];
+        if (j < d.conn.size() && idx < static_cast<int>(d.conn[j].size())) demand += d.conn[j][idx];
+    }
+    return demand;
+}
+
+static vector<double> computeBlockDemands(const InputData &d) {
+    vector<double> demand(d.blocks.size(), 0.0);
+    for (int i = 0; i < static_cast<int>(d.blocks.size()); ++i) demand[i] = totalBlockDemand(d, i);
+    return demand;
+}
+
+static double maxDemandValue(const vector<double> &demand) {
+    double m = 0.0;
+    for (double v : demand) m = max(m, v);
+    return m;
+}
+
+static double candidateCenterBiasScore(const Rect &candidate, double outlineW, double outlineH) {
+    double cx = candidate.lx + candidate.w / 2.0;
+    double cy = candidate.ly + candidate.h / 2.0;
+    return fabs(cx - outlineW / 2.0) + fabs(cy - outlineH / 2.0);
+}
+
+static double candidateCompactScore(const Rect &candidate) {
+    double top = candidate.ly + candidate.h;
+    double right = candidate.lx + candidate.w;
+    return top + 0.35 * right;
+}
+
+static FullPlacementResult placeAllBlocksAfterEdgesWithStrategy(const InputData &d,
+                                                                const ShapeResult &sr,
+                                                                const EdgePlacementResult &er,
+                                                                const PlacementStrategyConfig &cfg) {
     FullPlacementResult pr;
     pr.placements.assign(d.blocks.size(), FullBlockPlacement{});
+    pr.strategy_name = cfg.name;
 
     vector<Rect> placed;
     vector<Rect> placedByIndex(d.blocks.size());
+    vector<double> demand = computeBlockDemands(d);
+    double maxDemand = maxDemandValue(demand);
 
     // Copy EDGE placements from the previous step.
     for (size_t i = 0; i < d.blocks.size(); ++i) {
@@ -954,11 +1006,11 @@ static FullPlacementResult placeAllBlocksAfterEdges(const InputData &d, const Sh
         if (d.blocks[i].type != "EDGE") innerIdx.push_back(i);
     }
 
-    // Place larger and more constrained blocks first. MACRO keeps fixed shape, so it has priority.
     sort(innerIdx.begin(), innerIdx.end(), [&](int a, int b) {
         bool am = d.blocks[a].type == "MACRO";
         bool bm = d.blocks[b].type == "MACRO";
         if (am != bm) return am > bm;
+        if (cfg.demand_aware && fabs(demand[a] - demand[b]) > EPS) return demand[a] > demand[b];
         double areaA = sr.shapes[a].width * sr.shapes[a].height;
         double areaB = sr.shapes[b].width * sr.shapes[b].height;
         if (fabs(areaA - areaB) > EPS) return areaA > areaB;
@@ -971,22 +1023,59 @@ static FullPlacementResult placeAllBlocksAfterEdges(const InputData &d, const Sh
     for (int idx : innerIdx) {
         const Block &b = d.blocks[idx];
         const BlockShape &s = sr.shapes[idx];
-        vector<Rect> candidates = generateInteriorPlacementCandidates(b.name, s.width, s.height, d.outline_width, d.outline_height, placed);
+        double normDemand = (maxDemand > EPS ? demand[idx] / maxDemand : 0.0);
+        double dynamicGap = cfg.base_gap + cfg.extra_gap * sqrt(max(0.0, normDemand));
+
+        vector<double> gapTrials;
+        gapTrials.push_back(dynamicGap);
+        gapTrials.push_back(cfg.base_gap);
+        gapTrials.push_back(20.0);
+        gapTrials.push_back(8.0);
+        gapTrials.push_back(0.0);
+        vector<Rect> candidates;
+        double usedGap = dynamicGap;
+        for (double g : gapTrials) {
+            candidates = generateInteriorPlacementCandidates(b.name, s.width, s.height,
+                                                             d.outline_width, d.outline_height,
+                                                             placed, g);
+            if (!candidates.empty()) { usedGap = g; break; }
+        }
 
         if (candidates.empty()) {
             pr.errors.push_back(b.name + " cannot be placed inside outline without overlap. shape=" + fmt(s.width) + "x" + fmt(s.height));
             continue;
         }
 
-        // Default: compact bottom-left packing. If this block already connects to placed blocks,
-        // use connectivity as the first objective to get a slightly better baseline layout.
         double connWeight = connectivityWeightToPlaced(d, idx, placedByIndex);
         sort(candidates.begin(), candidates.end(), [&](const Rect &a, const Rect &bRect) {
-            if (connWeight > 0.0) {
-                double sa = candidateConnectivityScore(d, idx, a, placedByIndex);
-                double sb = candidateConnectivityScore(d, idx, bRect, placedByIndex);
-                if (fabs(sa - sb) > 1e-4) return sa < sb;
+            if (!cfg.demand_aware) {
+                // Preserve the exact Step-12 baseline ordering for a safe fallback.
+                if (connWeight > 0.0) {
+                    double sa = candidateConnectivityScore(d, idx, a, placedByIndex);
+                    double sb = candidateConnectivityScore(d, idx, bRect, placedByIndex);
+                    if (fabs(sa - sb) > 1e-4) return sa < sb;
+                }
+                double topA = a.ly + a.h;
+                double topB = bRect.ly + bRect.h;
+                if (fabs(topA - topB) > 1e-4) return topA < topB;
+                double rightA = a.lx + a.w;
+                double rightB = bRect.lx + bRect.w;
+                if (fabs(rightA - rightB) > 1e-4) return rightA < rightB;
+                if (fabs(a.ly - bRect.ly) > 1e-4) return a.ly < bRect.ly;
+                return a.lx < bRect.lx;
             }
+
+            double scoreA = 0.0;
+            double scoreB = 0.0;
+            if (connWeight > 0.0) {
+                scoreA += cfg.connectivity_weight * candidateConnectivityScore(d, idx, a, placedByIndex);
+                scoreB += cfg.connectivity_weight * candidateConnectivityScore(d, idx, bRect, placedByIndex);
+            }
+            scoreA += cfg.center_weight * normDemand * candidateCenterBiasScore(a, d.outline_width, d.outline_height);
+            scoreB += cfg.center_weight * normDemand * candidateCenterBiasScore(bRect, d.outline_width, d.outline_height);
+            scoreA += cfg.compact_weight * (1.0 - 0.55 * normDemand) * candidateCompactScore(a);
+            scoreB += cfg.compact_weight * (1.0 - 0.55 * normDemand) * candidateCompactScore(bRect);
+            if (fabs(scoreA - scoreB) > 1e-4) return scoreA < scoreB;
             double topA = a.ly + a.h;
             double topB = bRect.ly + bRect.h;
             if (fabs(topA - topB) > 1e-4) return topA < topB;
@@ -1000,7 +1089,7 @@ static FullPlacementResult placeAllBlocksAfterEdges(const InputData &d, const Sh
         Rect chosen = candidates.front();
         FullBlockPlacement bp;
         bp.placed = true;
-        bp.method = "INTERIOR_PACKED";
+        bp.method = cfg.demand_aware ? ("DEMAND_AWARE_GAP_" + fmt(usedGap)) : "INTERIOR_PACKED";
         bp.lx = chosen.lx;
         bp.ly = chosen.ly;
         bp.width = chosen.w;
@@ -1011,6 +1100,7 @@ static FullPlacementResult placeAllBlocksAfterEdges(const InputData &d, const Sh
         pr.placement_order.push_back(idx);
     }
 
+    pr.warnings.push_back("PLACEMENT_STRATEGY_USED: " + cfg.name);
     return pr;
 }
 
@@ -1299,6 +1389,7 @@ struct RoutingGenerationResult {
     int port_relaxed_count = 0;
     double total_estimated_wirelength = 0.0;
     vector<long long> channel_loads; // one value per channel, simple total nets passing through the channel
+    vector<long long> soft_ft_loads; // one value per input block; nets feedthroughing intermediate SOFT blocks
     vector<string> warnings;
     vector<string> errors;
 };
@@ -1470,6 +1561,196 @@ static bool bfsRouteOne(const InputData &d,
     return true;
 }
 
+static double simpleChannelCapacity(const ChannelRect &ch) {
+    // Same conservative capacity model used by the self-checker/report:
+    // 25 nets per um times the smaller dimension of the channel rectangle.
+    return max(EPS, 25.0 * min(ch.width, ch.height));
+}
+
+static double loadPenaltyForEnteringChannel(const ChannelGenerationResult &cr,
+                                            const vector<long long> &currentLoads,
+                                            int channelNode,
+                                            int blockCount,
+                                            int nets) {
+    int chIdx = channelNode - blockCount;
+    if (chIdx < 0 || chIdx >= static_cast<int>(cr.channels.size())) return 0.0;
+
+    double cap = simpleChannelCapacity(cr.channels[chIdx]);
+    double before = (chIdx < static_cast<int>(currentLoads.size())) ? static_cast<double>(currentLoads[chIdx]) : 0.0;
+    double after = before + static_cast<double>(nets);
+    double utilAfter = after / cap;
+    double overflowAfter = max(0.0, after - cap) / cap;
+
+    // The first term spreads load before overflow happens. The overflow term is intentionally strong,
+    // so a slightly longer path is preferred over pushing another channel far above capacity.
+    static constexpr double LOAD_WEIGHT = 20.0;
+    static constexpr double OVERFLOW_WEIGHT = 800.0;
+    return LOAD_WEIGHT * utilAfter * utilAfter + OVERFLOW_WEIGHT * overflowAfter * overflowAfter;
+}
+
+
+static double softFeedthroughCapacityEstimate(const InputData &d,
+                                              const FullPlacementResult &pr,
+                                              int blockIdx) {
+    if (blockIdx < 0 || blockIdx >= static_cast<int>(d.blocks.size())) return 1.0;
+    const FullBlockPlacement &bp = pr.placements[blockIdx];
+    double side = min(bp.width, bp.height);
+    return max(1000.0, 25.0 * max(1.0, side));
+}
+
+static double softFeedthroughPenaltyForEnteringBlock(const InputData &d,
+                                                     const FullPlacementResult &pr,
+                                                     const vector<long long> &currentFtLoads,
+                                                     int blockIdx,
+                                                     int nets) {
+    if (blockIdx < 0 || blockIdx >= static_cast<int>(d.blocks.size())) return 0.0;
+    if (d.blocks[blockIdx].type != "SOFT") return 1e9;
+    double cap = softFeedthroughCapacityEstimate(d, pr, blockIdx);
+    double before = (blockIdx < static_cast<int>(currentFtLoads.size())) ? static_cast<double>(currentFtLoads[blockIdx]) : 0.0;
+    double after = before + static_cast<double>(nets);
+    double utilAfter = after / cap;
+    double overflowAfter = max(0.0, after - cap) / cap;
+    static constexpr double FT_BASE_COST = 0.20;
+    static constexpr double FT_LOAD_WEIGHT = 3.0;
+    static constexpr double FT_OVERFLOW_WEIGHT = 45.0;
+    return FT_BASE_COST + FT_LOAD_WEIGHT * utilAfter * utilAfter + FT_OVERFLOW_WEIGHT * overflowAfter * overflowAfter;
+}
+
+static bool isIntermediateSoftBlockAllowed(const InputData &d, int node, int source, int target) {
+    if (node < 0 || node >= static_cast<int>(d.blocks.size())) return false;
+    if (node == source || node == target) return false;
+    return d.blocks[node].type == "SOFT";
+}
+
+static bool dijkstraLoadAwareRouteOne(const InputData &d,
+                                      const ChannelGenerationResult &cr,
+                                      const vector<vector<RoutingAdjEdge>> &graph,
+                                      const vector<long long> &currentLoads,
+                                      int source,
+                                      int target,
+                                      int nets,
+                                      bool respectPortEdges,
+                                      vector<int> &outNodes,
+                                      string &failReason) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    int nNodes = nBlocks + static_cast<int>(cr.channels.size());
+    const double INF = 1e100;
+    vector<double> dist(nNodes, INF);
+    vector<int> parent(nNodes, -1);
+
+    using State = pair<double, int>;
+    priority_queue<State, vector<State>, greater<State>> pq;
+    dist[source] = 0.0;
+    pq.push({0.0, source});
+
+    while (!pq.empty()) {
+        State cur = pq.top();
+        double du = cur.first;
+        int u = cur.second;
+        pq.pop();
+        if (du > dist[u] + EPS) continue;
+        if (u == target) break;
+
+        for (const RoutingAdjEdge &e : graph[u]) {
+            int v = e.to;
+            bool vIsBlock = !isChannelNode(v, nBlocks);
+
+            // Channel-only routing: after leaving source, only the target block may be visited.
+            if (vIsBlock && v != target) continue;
+
+            if (respectPortEdges) {
+                if (u == source && !edgeAllowedByPortConstraint(d.blocks[source], e.edge_from)) continue;
+                if (v == target && !edgeAllowedByPortConstraint(d.blocks[target], e.edge_to)) continue;
+            }
+
+            double stepCost = 1.0; // hop count keeps paths from taking unnecessary detours.
+            if (isChannelNode(v, nBlocks)) {
+                stepCost += loadPenaltyForEnteringChannel(cr, currentLoads, v, nBlocks, nets);
+            }
+            // A tiny deterministic tie-breaker helps keep output stable across platforms.
+            stepCost += 1e-6 * static_cast<double>(v + 1);
+
+            if (dist[u] + stepCost + EPS < dist[v]) {
+                dist[v] = dist[u] + stepCost;
+                parent[v] = u;
+                pq.push({dist[v], v});
+            }
+        }
+    }
+
+    if (dist[target] >= INF / 2.0) {
+        failReason = respectPortEdges ? "no load-aware channel-only path with current PORT EDGE constraints" : "no load-aware channel-only path even after relaxing PORT EDGE constraints";
+        return false;
+    }
+
+    vector<int> rev;
+    for (int cur = target; cur != -1; cur = parent[cur]) rev.push_back(cur);
+    reverse(rev.begin(), rev.end());
+    outNodes = rev;
+    return true;
+}
+
+
+static bool dijkstraLoadAwareRouteOneWithSoftFeedthrough(const InputData &d,
+                                                        const FullPlacementResult &pr,
+                                                        const ChannelGenerationResult &cr,
+                                                        const vector<vector<RoutingAdjEdge>> &graph,
+                                                        const vector<long long> &currentChannelLoads,
+                                                        const vector<long long> &currentFtLoads,
+                                                        int source,
+                                                        int target,
+                                                        int nets,
+                                                        bool respectPortEdges,
+                                                        vector<int> &outNodes,
+                                                        string &failReason) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    int nNodes = nBlocks + static_cast<int>(cr.channels.size());
+    const double INF = 1e100;
+    vector<double> dist(nNodes, INF);
+    vector<int> parent(nNodes, -1);
+    using State = pair<double, int>;
+    priority_queue<State, vector<State>, greater<State>> pq;
+    dist[source] = 0.0;
+    pq.push({0.0, source});
+    while (!pq.empty()) {
+        State cur = pq.top();
+        double du = cur.first;
+        int u = cur.second;
+        pq.pop();
+        if (du > dist[u] + EPS) continue;
+        if (u == target) break;
+        for (const RoutingAdjEdge &e : graph[u]) {
+            int v = e.to;
+            bool vIsBlock = !isChannelNode(v, nBlocks);
+            if (vIsBlock && v != target && !isIntermediateSoftBlockAllowed(d, v, source, target)) continue;
+            if (respectPortEdges) {
+                if (u == source && !edgeAllowedByPortConstraint(d.blocks[source], e.edge_from)) continue;
+                if (v == target && !edgeAllowedByPortConstraint(d.blocks[target], e.edge_to)) continue;
+            }
+            double stepCost = 1.0;
+            if (isChannelNode(v, nBlocks)) {
+                stepCost += loadPenaltyForEnteringChannel(cr, currentChannelLoads, v, nBlocks, nets);
+            } else if (isIntermediateSoftBlockAllowed(d, v, source, target)) {
+                stepCost += softFeedthroughPenaltyForEnteringBlock(d, pr, currentFtLoads, v, nets);
+            }
+            stepCost += 1e-6 * static_cast<double>(v + 1);
+            if (dist[u] + stepCost + EPS < dist[v]) {
+                dist[v] = dist[u] + stepCost;
+                parent[v] = u;
+                pq.push({dist[v], v});
+            }
+        }
+    }
+    if (dist[target] >= INF / 2.0) {
+        failReason = respectPortEdges ? "no soft-feedthrough path with current PORT EDGE constraints" : "no soft-feedthrough path even after relaxing PORT EDGE constraints";
+        return false;
+    }
+    vector<int> rev;
+    for (int cur = target; cur != -1; cur = parent[cur]) rev.push_back(cur);
+    reverse(rev.begin(), rev.end());
+    outNodes = rev;
+    return true;
+}
 
 static bool makeSelfRouteViaOneAdjacentChannel(const InputData &d,
                                                const ChannelGenerationResult &cr,
@@ -1488,6 +1769,38 @@ static bool makeSelfRouteViaOneAdjacentChannel(const InputData &d,
     failReason = respectPortEdges ? "self-connection has no adjacent channel on allowed PORT EDGE" : "self-connection has no adjacent channel";
     (void)cr;
     return false;
+}
+
+static bool makeSelfRouteViaLeastLoadedAdjacentChannel(const InputData &d,
+                                                       const ChannelGenerationResult &cr,
+                                                       const vector<vector<RoutingAdjEdge>> &graph,
+                                                       const vector<long long> &currentLoads,
+                                                       int block,
+                                                       int nets,
+                                                       bool respectPortEdges,
+                                                       vector<int> &outNodes,
+                                                       string &failReason) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    double bestCost = 1e100;
+    int bestChannel = -1;
+
+    for (const RoutingAdjEdge &e : graph[block]) {
+        if (!isChannelNode(e.to, nBlocks)) continue;
+        if (respectPortEdges && !edgeAllowedByPortConstraint(d.blocks[block], e.edge_from)) continue;
+        double cost = loadPenaltyForEnteringChannel(cr, currentLoads, e.to, nBlocks, nets) + 1e-6 * static_cast<double>(e.to + 1);
+        if (cost + EPS < bestCost) {
+            bestCost = cost;
+            bestChannel = e.to;
+        }
+    }
+
+    if (bestChannel >= 0) {
+        outNodes = {block, bestChannel, block};
+        return true;
+    }
+
+    // Keep the old simple self-route as an emergency fallback and to preserve behavior for unusual cases.
+    return makeSelfRouteViaOneAdjacentChannel(d, cr, graph, block, respectPortEdges, outNodes, failReason);
 }
 
 
@@ -1517,11 +1830,12 @@ static double estimateRouteWirelengthAndSteps(const InputData &d,
     return oneNetLength * static_cast<double>(nets);
 }
 
-static RoutingGenerationResult routeAllConnectionsThroughChannelsOnly(const InputData &d,
-                                                                       const FullPlacementResult &pr,
-                                                                       const ChannelGenerationResult &cr) {
+static RoutingGenerationResult routeAllConnectionsBaselineBfsChannelOnly(const InputData &d,
+                                                                          const FullPlacementResult &pr,
+                                                                          const ChannelGenerationResult &cr) {
     RoutingGenerationResult rr;
     rr.channel_loads.assign(cr.channels.size(), 0);
+    rr.soft_ft_loads.assign(d.blocks.size(), 0);
     vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
 
     int nBlocks = static_cast<int>(d.blocks.size());
@@ -1540,8 +1854,6 @@ static RoutingGenerationResult routeAllConnectionsThroughChannelsOnly(const Inpu
             ok = bfsRouteOne(d, cr, graph, conn.from, conn.to, true, nodes, reason);
         }
         if (!ok) {
-            // For this baseline step, still try to close every route through channels.
-            // We record this as a warning because final submission may need stricter port handling.
             string strictReason = reason;
             if (conn.from == conn.to) {
                 ok = makeSelfRouteViaOneAdjacentChannel(d, cr, graph, conn.from, false, nodes, reason);
@@ -1576,34 +1888,834 @@ static RoutingGenerationResult routeAllConnectionsThroughChannelsOnly(const Inpu
                     if (chIdx >= 0 && chIdx < static_cast<int>(rr.channel_loads.size())) rr.channel_loads[chIdx] += conn.nets;
                 }
             }
+            for (size_t ni = 1; ni + 1 < nodes.size(); ++ni) {
+                int node = nodes[ni];
+                if (!isChannelNode(node, nBlocks) && node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") {
+                    if (node < static_cast<int>(rr.soft_ft_loads.size())) rr.soft_ft_loads[node] += conn.nets;
+                }
+            }
         }
         rr.routes.push_back(rp);
     }
     return rr;
 }
 
-static bool verifyAllConnectionsRouted(const InputData &d, const RoutingGenerationResult &rr, vector<string> &errors) {
-    bool ok = true;
-    if (rr.routes.size() != d.connections.size()) {
-        errors.push_back("Route pattern count does not match nonzero connection count.");
-        ok = false;
+struct RoutingQualitySummary {
+    int overflow_count = 0;
+    double total_overflow = 0.0;
+    double max_overflow = 0.0;
+    double total_wirelength = 0.0;
+    int unrouted_count = 0;
+};
+
+static RoutingQualitySummary summarizeRoutingQuality(const ChannelGenerationResult &cr,
+                                                     const RoutingGenerationResult &rr) {
+    RoutingQualitySummary q;
+    q.total_wirelength = rr.total_estimated_wirelength;
+    q.unrouted_count = rr.unrouted_count;
+    for (size_t i = 0; i < cr.channels.size(); ++i) {
+        double load = (i < rr.channel_loads.size()) ? static_cast<double>(rr.channel_loads[i]) : 0.0;
+        double overflow = max(0.0, load - simpleChannelCapacity(cr.channels[i]));
+        if (overflow > EPS) {
+            q.overflow_count++;
+            q.total_overflow += overflow;
+            q.max_overflow = max(q.max_overflow, overflow);
+        }
     }
+    return q;
+}
+
+static string routingQualityToString(const RoutingQualitySummary &q) {
+    ostringstream oss;
+    oss << "overflow_count=" << q.overflow_count
+        << " total_overflow=" << fmt(q.total_overflow)
+        << " max_overflow=" << fmt(q.max_overflow)
+        << " unrouted=" << q.unrouted_count
+        << " wirelength=" << fmt(q.total_wirelength);
+    return oss.str();
+}
+
+static bool routingQualityBetter(const RoutingQualitySummary &a, const RoutingQualitySummary &b) {
+    if (a.unrouted_count != b.unrouted_count) return a.unrouted_count < b.unrouted_count;
+    if (fabs(a.total_overflow - b.total_overflow) > 1e-3) return a.total_overflow < b.total_overflow;
+    if (a.overflow_count != b.overflow_count) return a.overflow_count < b.overflow_count;
+    if (fabs(a.max_overflow - b.max_overflow) > 1e-3) return a.max_overflow < b.max_overflow;
+    return a.total_wirelength < b.total_wirelength;
+}
+
+static string pairKey(int a, int b);
+
+static vector<Connection> splitConnectionsByTargetChunk(const InputData &d,
+                                                        int targetChunk,
+                                                        int minSplitNets,
+                                                        int maxPartsPerConnection) {
+    vector<Connection> jobs;
+    for (const Connection &c : d.connections) {
+        if (c.nets <= minSplitNets || targetChunk <= 0) {
+            jobs.push_back(c);
+            continue;
+        }
+        int parts = static_cast<int>(ceil(static_cast<double>(c.nets) / static_cast<double>(targetChunk)));
+        parts = max(1, min(parts, maxPartsPerConnection));
+        if (parts <= 1) {
+            jobs.push_back(c);
+            continue;
+        }
+        int base = c.nets / parts;
+        int rem = c.nets % parts;
+        for (int k = 0; k < parts; ++k) {
+            Connection piece;
+            piece.from = c.from;
+            piece.to = c.to;
+            piece.nets = base + (k < rem ? 1 : 0);
+            if (piece.nets > 0) jobs.push_back(piece);
+        }
+    }
+    return jobs;
+}
+
+static string splitJobSummary(const InputData &d, const vector<Connection> &jobs) {
+    int splitPairs = 0;
+    map<string, int> cnt;
+    for (const Connection &j : jobs) cnt[pairKey(j.from, j.to)]++;
+    for (const Connection &c : d.connections) if (cnt[pairKey(c.from, c.to)] > 1) splitPairs++;
+    stringstream ss;
+    ss << "original_connections=" << d.connections.size()
+       << " route_jobs=" << jobs.size()
+       << " split_connections=" << splitPairs;
+    return ss.str();
+}
+
+static RoutingGenerationResult routeConnectionJobsLoadAwareChannelOnly(const InputData &d,
+                                                                       const FullPlacementResult &pr,
+                                                                       const ChannelGenerationResult &cr,
+                                                                       const vector<Connection> &jobs,
+                                                                       const string &modeLabel) {
+    RoutingGenerationResult rr;
+    rr.channel_loads.assign(cr.channels.size(), 0);
+    rr.soft_ft_loads.assign(d.blocks.size(), 0);
+    vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
+
+    // Route high-demand jobs first. When a large matrix entry is split, each piece can choose
+    // a different route, so congestion can be spread across alternate channels.
+    vector<int> order(jobs.size());
+    iota(order.begin(), order.end(), 0);
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        const Connection &ca = jobs[a];
+        const Connection &cb = jobs[b];
+        if (ca.nets != cb.nets) return ca.nets > cb.nets;
+        string aa = d.blocks[ca.from].name + "->" + d.blocks[ca.to].name;
+        string bb = d.blocks[cb.from].name + "->" + d.blocks[cb.to].name;
+        if (aa != bb) return aa < bb;
+        return a < b;
+    });
+
+    int nBlocks = static_cast<int>(d.blocks.size());
+    for (int jobIndex : order) {
+        const Connection &conn = jobs[jobIndex];
+        RoutePattern rp;
+        rp.from = conn.from;
+        rp.to = conn.to;
+        rp.nets = conn.nets;
+
+        vector<int> nodes;
+        string reason;
+        bool ok = false;
+        if (conn.from == conn.to) {
+            ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, rr.channel_loads, conn.from, conn.nets, true, nodes, reason);
+        } else {
+            ok = dijkstraLoadAwareRouteOne(d, cr, graph, rr.channel_loads, conn.from, conn.to, conn.nets, true, nodes, reason);
+        }
+        if (!ok) {
+            // Try a relaxed-port load-aware route first. If even that fails, fall back to BFS so
+            // the solution tries to remain closed instead of creating routing-open failures.
+            string strictReason = reason;
+            if (conn.from == conn.to) {
+                ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, rr.channel_loads, conn.from, conn.nets, false, nodes, reason);
+            } else {
+                ok = dijkstraLoadAwareRouteOne(d, cr, graph, rr.channel_loads, conn.from, conn.to, conn.nets, false, nodes, reason);
+            }
+            if (!ok && conn.from != conn.to) {
+                ok = bfsRouteOne(d, cr, graph, conn.from, conn.to, false, nodes, reason);
+            }
+            if (ok) {
+                rp.used_port_relaxation = true;
+                rr.port_relaxed_count++;
+                rr.warnings.push_back(d.blocks[conn.from].name + " -> " + d.blocks[conn.to].name +
+                                      " required PORT EDGE relaxation. Strict failure reason: " + strictReason);
+            }
+        }
+
+        if (!ok) {
+            rp.routed = false;
+            rp.fail_reason = reason;
+            rr.unrouted_count++;
+            rr.unrouted_nets += conn.nets;
+            rr.errors.push_back("Unrouted route job " + d.blocks[conn.from].name + " -> " + d.blocks[conn.to].name +
+                                " nets=" + to_string(conn.nets) + ": " + reason);
+        } else {
+            rp.routed = true;
+            rp.nodes = nodes;
+            rp.estimated_wirelength = estimateRouteWirelengthAndSteps(d, cr, graph, nodes, conn.nets, rp.steps);
+            rr.routed_count++;
+            rr.routed_nets += conn.nets;
+            rr.total_estimated_wirelength += rp.estimated_wirelength;
+            for (int node : nodes) {
+                if (isChannelNode(node, nBlocks)) {
+                    int chIdx = node - nBlocks;
+                    if (chIdx >= 0 && chIdx < static_cast<int>(rr.channel_loads.size())) rr.channel_loads[chIdx] += conn.nets;
+                }
+            }
+            for (size_t ni = 1; ni + 1 < nodes.size(); ++ni) {
+                int node = nodes[ni];
+                if (!isChannelNode(node, nBlocks) && node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") {
+                    if (node < static_cast<int>(rr.soft_ft_loads.size())) rr.soft_ft_loads[node] += conn.nets;
+                }
+            }
+        }
+        rr.routes.push_back(rp);
+    }
+
+    rr.warnings.insert(rr.warnings.begin(), modeLabel + ": " + splitJobSummary(d, jobs));
+    return rr;
+}
+
+static RoutingGenerationResult routeAllConnectionsLoadAwareChannelOnly(const InputData &d,
+                                                                       const FullPlacementResult &pr,
+                                                                       const ChannelGenerationResult &cr) {
+    return routeConnectionJobsLoadAwareChannelOnly(d, pr, cr, d.connections, "LOAD_AWARE_NO_SPLIT");
+}
+
+static RoutingGenerationResult routeAllConnectionsSplitLoadAwareChannelOnly(const InputData &d,
+                                                                            const FullPlacementResult &pr,
+                                                                            const ChannelGenerationResult &cr,
+                                                                            int targetChunk,
+                                                                            int minSplitNets,
+                                                                            int maxPartsPerConnection) {
+    vector<Connection> jobs = splitConnectionsByTargetChunk(d, targetChunk, minSplitNets, maxPartsPerConnection);
+    RoutingGenerationResult rr = routeConnectionJobsLoadAwareChannelOnly(
+        d, pr, cr, jobs,
+        "SPLIT_LOAD_AWARE target_chunk=" + to_string(targetChunk) +
+        " min_split_nets=" + to_string(minSplitNets) +
+        " max_parts=" + to_string(maxPartsPerConnection));
+    return rr;
+}
+
+
+static void resetRoutingAggregateStats(RoutingGenerationResult &rr, size_t channelCount) {
+    rr.routed_nets = 0;
+    rr.unrouted_nets = 0;
+    rr.routed_count = 0;
+    rr.unrouted_count = 0;
+    rr.port_relaxed_count = 0;
+    rr.total_estimated_wirelength = 0.0;
+    rr.channel_loads.assign(channelCount, 0);
+    if (!rr.soft_ft_loads.empty()) rr.soft_ft_loads.assign(rr.soft_ft_loads.size(), 0);
+    rr.errors.clear();
+}
+
+static void recomputeRoutingAggregateStats(const InputData &d,
+                                           const ChannelGenerationResult &cr,
+                                           RoutingGenerationResult &rr) {
+    resetRoutingAggregateStats(rr, cr.channels.size());
+    rr.soft_ft_loads.assign(d.blocks.size(), 0);
+    int nBlocks = static_cast<int>(d.blocks.size());
     for (const RoutePattern &rp : rr.routes) {
         if (!rp.routed) {
-            errors.push_back("Missing route for " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name);
+            rr.unrouted_count++;
+            rr.unrouted_nets += rp.nets;
+            rr.errors.push_back("Unrouted connection " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name +
+                                " nets=" + to_string(rp.nets) + ": " + rp.fail_reason);
+            continue;
+        }
+        rr.routed_count++;
+        rr.routed_nets += rp.nets;
+        if (rp.used_port_relaxation) rr.port_relaxed_count++;
+        rr.total_estimated_wirelength += rp.estimated_wirelength;
+        for (int node : rp.nodes) {
+            if (!isChannelNode(node, nBlocks)) continue;
+            int chIdx = node - nBlocks;
+            if (chIdx >= 0 && chIdx < static_cast<int>(rr.channel_loads.size())) {
+                rr.channel_loads[chIdx] += rp.nets;
+            }
+        }
+        for (size_t ni = 1; ni + 1 < rp.nodes.size(); ++ni) {
+            int node = rp.nodes[ni];
+            if (!isChannelNode(node, nBlocks) && node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") {
+                if (node < static_cast<int>(rr.soft_ft_loads.size())) rr.soft_ft_loads[node] += rp.nets;
+            }
+        }
+    }
+}
+
+static vector<double> computeChannelOverflowVector(const ChannelGenerationResult &cr,
+                                                   const vector<long long> &loads) {
+    vector<double> overflow(cr.channels.size(), 0.0);
+    for (size_t i = 0; i < cr.channels.size(); ++i) {
+        double load = (i < loads.size()) ? static_cast<double>(loads[i]) : 0.0;
+        overflow[i] = max(0.0, load - simpleChannelCapacity(cr.channels[i]));
+    }
+    return overflow;
+}
+
+static void addRouteLoadToVector(const InputData &d,
+                                 const RoutePattern &rp,
+                                 vector<long long> &loads,
+                                 long long sign) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    if (!rp.routed) return;
+    for (int node : rp.nodes) {
+        if (!isChannelNode(node, nBlocks)) continue;
+        int chIdx = node - nBlocks;
+        if (chIdx < 0 || chIdx >= static_cast<int>(loads.size())) continue;
+        long long next = loads[chIdx] + sign * static_cast<long long>(rp.nets);
+        loads[chIdx] = max(0LL, next);
+    }
+}
+
+static void addRouteSoftFtLoadToVector(const InputData &d,
+                                        const RoutePattern &rp,
+                                        vector<long long> &ftLoads,
+                                        long long sign) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    if (!rp.routed) return;
+    if (ftLoads.size() < d.blocks.size()) ftLoads.resize(d.blocks.size(), 0);
+    for (size_t ni = 1; ni + 1 < rp.nodes.size(); ++ni) {
+        int node = rp.nodes[ni];
+        if (isChannelNode(node, nBlocks)) continue;
+        if (node < 0 || node >= nBlocks) continue;
+        if (d.blocks[node].type != "SOFT") continue;
+        long long next = ftLoads[node] + sign * static_cast<long long>(rp.nets);
+        ftLoads[node] = max(0LL, next);
+    }
+}
+
+static bool buildOneLoadAwareRoutePattern(const InputData &d,
+                                          const ChannelGenerationResult &cr,
+                                          const vector<vector<RoutingAdjEdge>> &graph,
+                                          const vector<long long> &currentLoads,
+                                          int from,
+                                          int to,
+                                          int nets,
+                                          RoutePattern &rp) {
+    rp = RoutePattern();
+    rp.from = from;
+    rp.to = to;
+    rp.nets = nets;
+
+    vector<int> nodes;
+    string reason;
+    bool ok = false;
+    if (from == to) {
+        ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, currentLoads, from, nets, true, nodes, reason);
+    } else {
+        ok = dijkstraLoadAwareRouteOne(d, cr, graph, currentLoads, from, to, nets, true, nodes, reason);
+    }
+
+    if (!ok) {
+        string strictReason = reason;
+        if (from == to) {
+            ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, currentLoads, from, nets, false, nodes, reason);
+        } else {
+            ok = dijkstraLoadAwareRouteOne(d, cr, graph, currentLoads, from, to, nets, false, nodes, reason);
+        }
+        if (!ok && from != to) {
+            ok = bfsRouteOne(d, cr, graph, from, to, false, nodes, reason);
+        }
+        if (ok) {
+            rp.used_port_relaxation = true;
+            rp.fail_reason = "strict port-edge route was unavailable: " + strictReason;
+        }
+    }
+
+    if (!ok) {
+        rp.routed = false;
+        rp.fail_reason = reason;
+        return false;
+    }
+
+    rp.routed = true;
+    rp.nodes = nodes;
+    rp.estimated_wirelength = estimateRouteWirelengthAndSteps(d, cr, graph, nodes, nets, rp.steps);
+    return true;
+}
+
+static bool buildOneSoftFeedthroughRoutePattern(const InputData &d,
+                                                   const FullPlacementResult &pr,
+                                                   const ChannelGenerationResult &cr,
+                                                   const vector<vector<RoutingAdjEdge>> &graph,
+                                                   const vector<long long> &currentChannelLoads,
+                                                   const vector<long long> &currentFtLoads,
+                                                   int from,
+                                                   int to,
+                                                   int nets,
+                                                   RoutePattern &rp) {
+    rp = RoutePattern();
+    rp.from = from;
+    rp.to = to;
+    rp.nets = nets;
+    vector<int> nodes;
+    string reason;
+    bool ok = false;
+    if (from == to) ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, currentChannelLoads, from, nets, true, nodes, reason);
+    else ok = dijkstraLoadAwareRouteOneWithSoftFeedthrough(d, pr, cr, graph, currentChannelLoads, currentFtLoads, from, to, nets, true, nodes, reason);
+    if (!ok) {
+        string strictReason = reason;
+        if (from == to) ok = makeSelfRouteViaLeastLoadedAdjacentChannel(d, cr, graph, currentChannelLoads, from, nets, false, nodes, reason);
+        else ok = dijkstraLoadAwareRouteOneWithSoftFeedthrough(d, pr, cr, graph, currentChannelLoads, currentFtLoads, from, to, nets, false, nodes, reason);
+        if (!ok && from != to) ok = dijkstraLoadAwareRouteOne(d, cr, graph, currentChannelLoads, from, to, nets, false, nodes, reason);
+        if (!ok && from != to) ok = bfsRouteOne(d, cr, graph, from, to, false, nodes, reason);
+        if (ok) { rp.used_port_relaxation = true; rp.fail_reason = "strict soft-feedthrough route was unavailable: " + strictReason; }
+    }
+    if (!ok) { rp.routed = false; rp.fail_reason = reason; return false; }
+    rp.routed = true;
+    rp.nodes = nodes;
+    rp.estimated_wirelength = estimateRouteWirelengthAndSteps(d, cr, graph, nodes, nets, rp.steps);
+    return true;
+}
+
+static double routeOverflowScore(const InputData &d,
+                                 const RoutePattern &rp,
+                                 const vector<double> &overflowByChannel) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    double score = 0.0;
+    set<int> used;
+    for (int node : rp.nodes) {
+        if (!isChannelNode(node, nBlocks)) continue;
+        int chIdx = node - nBlocks;
+        if (chIdx < 0 || chIdx >= static_cast<int>(overflowByChannel.size())) continue;
+        if (used.insert(chIdx).second) {
+            score += overflowByChannel[chIdx];
+        }
+    }
+    if (score > EPS) score *= max(1, rp.nets);
+    return score;
+}
+
+static RoutingGenerationResult ripUpAndRerouteOverflowChannels(const InputData &d,
+                                                               const FullPlacementResult &pr,
+                                                               const ChannelGenerationResult &cr,
+                                                               const RoutingGenerationResult &start) {
+    RoutingGenerationResult best = start;
+    recomputeRoutingAggregateStats(d, cr, best);
+
+    vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
+    RoutingQualitySummary bestQ = summarizeRoutingQuality(cr, best);
+
+    static constexpr int MAX_RIPUP_ITER = 10;
+    for (int iter = 1; iter <= MAX_RIPUP_ITER; ++iter) {
+        vector<double> overflowByChannel = computeChannelOverflowVector(cr, best.channel_loads);
+        vector<pair<double, int>> candidates;
+        for (int i = 0; i < static_cast<int>(best.routes.size()); ++i) {
+            const RoutePattern &rp = best.routes[i];
+            if (!rp.routed) continue;
+            double score = routeOverflowScore(d, rp, overflowByChannel);
+            if (score > EPS) candidates.push_back({score, i});
+        }
+        if (candidates.empty()) break;
+
+        sort(candidates.begin(), candidates.end(), [](const pair<double, int> &a, const pair<double, int> &b) {
+            if (fabs(a.first - b.first) > EPS) return a.first > b.first;
+            return a.second < b.second;
+        });
+
+        // Reroute only the strongest contributors each iteration. Removing too many at once can
+        // destabilize the solution and make paths chase each other around the floorplan.
+        int ripCount = min<int>(static_cast<int>(candidates.size()), max(4, static_cast<int>(best.routes.size()) / 5));
+        ripCount = min(ripCount, 24);
+
+        RoutingGenerationResult trial = best;
+        vector<int> ripped;
+        ripped.reserve(ripCount);
+        for (int k = 0; k < ripCount; ++k) ripped.push_back(candidates[k].second);
+
+        // Remove all selected route loads first, then reroute them in descending net-count order.
+        vector<long long> trialLoads = trial.channel_loads;
+        for (int idx : ripped) addRouteLoadToVector(d, trial.routes[idx], trialLoads, -1);
+        sort(ripped.begin(), ripped.end(), [&](int a, int b) {
+            const RoutePattern &ra = trial.routes[a];
+            const RoutePattern &rb = trial.routes[b];
+            if (ra.nets != rb.nets) return ra.nets > rb.nets;
+            return a < b;
+        });
+
+        int changedRoutes = 0;
+        for (int idx : ripped) {
+            const RoutePattern oldRoute = trial.routes[idx];
+            RoutePattern newRoute;
+            bool ok = buildOneLoadAwareRoutePattern(d, cr, graph, trialLoads,
+                                                    oldRoute.from, oldRoute.to, oldRoute.nets, newRoute);
+            if (!ok) {
+                // Preserve route closure. If the new attempt fails, put the old route back.
+                trial.routes[idx] = oldRoute;
+                addRouteLoadToVector(d, oldRoute, trialLoads, +1);
+                continue;
+            }
+
+            trial.routes[idx] = newRoute;
+            addRouteLoadToVector(d, newRoute, trialLoads, +1);
+            if (newRoute.nodes != oldRoute.nodes) changedRoutes++;
+        }
+
+        recomputeRoutingAggregateStats(d, cr, trial);
+        RoutingQualitySummary trialQ = summarizeRoutingQuality(cr, trial);
+        if (routingQualityBetter(trialQ, bestQ)) {
+            best = trial;
+            bestQ = trialQ;
+            best.warnings.push_back("RIPUP_REROUTE_ACCEPTED_ITER_" + to_string(iter) +
+                                    ": ripped=" + to_string(ripCount) +
+                                    " changed=" + to_string(changedRoutes) +
+                                    " quality{" + routingQualityToString(bestQ) + "}");
+        } else {
+            best.warnings.push_back("RIPUP_REROUTE_STOPPED_ITER_" + to_string(iter) +
+                                    ": no quality improvement after ripping " + to_string(ripCount) + " routes" +
+                                    " | trial{" + routingQualityToString(trialQ) + "}" +
+                                    " | best{" + routingQualityToString(bestQ) + "}");
+            break;
+        }
+    }
+
+    best.warnings.insert(best.warnings.begin(), "RIPUP_REROUTE_FINAL: " + routingQualityToString(bestQ));
+    return best;
+}
+
+static RoutingGenerationResult routeConnectionJobsLoadAwareWithSoftFeedthrough(const InputData &d,
+                                                                                  const FullPlacementResult &pr,
+                                                                                  const ChannelGenerationResult &cr,
+                                                                                  const vector<Connection> &jobs,
+                                                                                  const string &modeLabel) {
+    RoutingGenerationResult rr;
+    rr.channel_loads.assign(cr.channels.size(), 0);
+    rr.soft_ft_loads.assign(d.blocks.size(), 0);
+    vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
+    vector<int> order(jobs.size());
+    iota(order.begin(), order.end(), 0);
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        const Connection &ca = jobs[a]; const Connection &cb = jobs[b];
+        if (ca.nets != cb.nets) return ca.nets > cb.nets;
+        string aa = d.blocks[ca.from].name + "->" + d.blocks[ca.to].name;
+        string bb = d.blocks[cb.from].name + "->" + d.blocks[cb.to].name;
+        if (aa != bb) return aa < bb;
+        return a < b;
+    });
+    int nBlocks = static_cast<int>(d.blocks.size());
+    for (int jobIndex : order) {
+        const Connection &conn = jobs[jobIndex];
+        RoutePattern rp;
+        bool ok = buildOneSoftFeedthroughRoutePattern(d, pr, cr, graph, rr.channel_loads, rr.soft_ft_loads, conn.from, conn.to, conn.nets, rp);
+        if (!ok) {
+            rr.unrouted_count++; rr.unrouted_nets += conn.nets;
+            rr.errors.push_back("Unrouted soft-feedthrough route job " + d.blocks[conn.from].name + " -> " + d.blocks[conn.to].name + " nets=" + to_string(conn.nets) + ": " + rp.fail_reason);
+        } else {
+            rr.routed_count++; rr.routed_nets += conn.nets;
+            if (rp.used_port_relaxation) rr.port_relaxed_count++;
+            rr.total_estimated_wirelength += rp.estimated_wirelength;
+            for (int node : rp.nodes) if (isChannelNode(node, nBlocks)) { int chIdx = node - nBlocks; if (chIdx >= 0 && chIdx < static_cast<int>(rr.channel_loads.size())) rr.channel_loads[chIdx] += conn.nets; }
+            for (size_t ni = 1; ni + 1 < rp.nodes.size(); ++ni) { int node = rp.nodes[ni]; if (!isChannelNode(node, nBlocks) && node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") rr.soft_ft_loads[node] += conn.nets; }
+        }
+        rr.routes.push_back(rp);
+    }
+    long long totalFt = 0; int softUsed = 0;
+    for (long long v : rr.soft_ft_loads) { totalFt += v; if (v > 0) softUsed++; }
+    rr.warnings.insert(rr.warnings.begin(), modeLabel + ": " + splitJobSummary(d, jobs) + " soft_ft_blocks_used=" + to_string(softUsed) + " soft_ft_total_nets=" + to_string(totalFt));
+    return rr;
+}
+
+static RoutingGenerationResult routeAllConnectionsSoftFeedthroughNoSplit(const InputData &d,
+                                                                         const FullPlacementResult &pr,
+                                                                         const ChannelGenerationResult &cr) {
+    return routeConnectionJobsLoadAwareWithSoftFeedthrough(d, pr, cr, d.connections, "SOFT_FEEDTHROUGH_NO_SPLIT");
+}
+
+static RoutingGenerationResult routeAllConnectionsSplitSoftFeedthrough(const InputData &d,
+                                                                       const FullPlacementResult &pr,
+                                                                       const ChannelGenerationResult &cr,
+                                                                       int targetChunk,
+                                                                       int minSplitNets,
+                                                                       int maxPartsPerConnection) {
+    vector<Connection> jobs = splitConnectionsByTargetChunk(d, targetChunk, minSplitNets, maxPartsPerConnection);
+    return routeConnectionJobsLoadAwareWithSoftFeedthrough(d, pr, cr, jobs,
+        "SPLIT_SOFT_FEEDTHROUGH target_chunk=" + to_string(targetChunk) + " min_split_nets=" + to_string(minSplitNets) + " max_parts=" + to_string(maxPartsPerConnection));
+}
+
+static RoutingGenerationResult ripUpAndRerouteOverflowChannelsWithSoftFeedthrough(const InputData &d,
+                                                                                  const FullPlacementResult &pr,
+                                                                                  const ChannelGenerationResult &cr,
+                                                                                  const RoutingGenerationResult &start) {
+    RoutingGenerationResult best = start;
+    recomputeRoutingAggregateStats(d, cr, best);
+    vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
+    RoutingQualitySummary bestQ = summarizeRoutingQuality(cr, best);
+    static constexpr int MAX_RIPUP_ITER = 8;
+    for (int iter = 1; iter <= MAX_RIPUP_ITER; ++iter) {
+        vector<double> overflowByChannel = computeChannelOverflowVector(cr, best.channel_loads);
+        vector<pair<double, int>> candidates;
+        for (int i = 0; i < static_cast<int>(best.routes.size()); ++i) { const RoutePattern &rp = best.routes[i]; if (!rp.routed) continue; double score = routeOverflowScore(d, rp, overflowByChannel); if (score > EPS) candidates.push_back({score, i}); }
+        if (candidates.empty()) break;
+        sort(candidates.begin(), candidates.end(), [](const pair<double, int> &a, const pair<double, int> &b) { if (fabs(a.first - b.first) > EPS) return a.first > b.first; return a.second < b.second; });
+        int ripCount = min<int>(static_cast<int>(candidates.size()), max(4, static_cast<int>(best.routes.size()) / 5)); ripCount = min(ripCount, 24);
+        RoutingGenerationResult trial = best;
+        vector<int> ripped; for (int k = 0; k < ripCount; ++k) ripped.push_back(candidates[k].second);
+        vector<long long> trialChannelLoads = trial.channel_loads; vector<long long> trialFtLoads = trial.soft_ft_loads;
+        for (int idx : ripped) { addRouteLoadToVector(d, trial.routes[idx], trialChannelLoads, -1); addRouteSoftFtLoadToVector(d, trial.routes[idx], trialFtLoads, -1); }
+        sort(ripped.begin(), ripped.end(), [&](int a, int b) { if (trial.routes[a].nets != trial.routes[b].nets) return trial.routes[a].nets > trial.routes[b].nets; return a < b; });
+        int changedRoutes = 0;
+        for (int idx : ripped) {
+            const RoutePattern oldRoute = trial.routes[idx]; RoutePattern newRoute;
+            bool ok = buildOneSoftFeedthroughRoutePattern(d, pr, cr, graph, trialChannelLoads, trialFtLoads, oldRoute.from, oldRoute.to, oldRoute.nets, newRoute);
+            if (!ok) { trial.routes[idx] = oldRoute; addRouteLoadToVector(d, oldRoute, trialChannelLoads, +1); addRouteSoftFtLoadToVector(d, oldRoute, trialFtLoads, +1); continue; }
+            trial.routes[idx] = newRoute; addRouteLoadToVector(d, newRoute, trialChannelLoads, +1); addRouteSoftFtLoadToVector(d, newRoute, trialFtLoads, +1); if (newRoute.nodes != oldRoute.nodes) changedRoutes++;
+        }
+        recomputeRoutingAggregateStats(d, cr, trial);
+        RoutingQualitySummary trialQ = summarizeRoutingQuality(cr, trial);
+        if (routingQualityBetter(trialQ, bestQ)) { best = trial; bestQ = trialQ; best.warnings.push_back("SOFT_FT_RIPUP_ACCEPTED_ITER_" + to_string(iter) + ": ripped=" + to_string(ripCount) + " changed=" + to_string(changedRoutes) + " quality{" + routingQualityToString(bestQ) + "}"); }
+        else { best.warnings.push_back("SOFT_FT_RIPUP_STOPPED_ITER_" + to_string(iter) + ": no quality improvement | trial{" + routingQualityToString(trialQ) + "} | best{" + routingQualityToString(bestQ) + "}"); break; }
+    }
+    best.warnings.insert(best.warnings.begin(), "SOFT_FT_RIPUP_FINAL: " + routingQualityToString(bestQ));
+    return best;
+}
+
+static RoutingGenerationResult routeAllConnectionsHybridLoadAwareChannelOnly(const InputData &d,
+                                                                             const FullPlacementResult &pr,
+                                                                             const ChannelGenerationResult &cr) {
+    vector<pair<string, RoutingGenerationResult>> candidates;
+
+    RoutingGenerationResult baseline = routeAllConnectionsBaselineBfsChannelOnly(d, pr, cr);
+    candidates.push_back({"BASELINE_BFS", baseline});
+
+    RoutingGenerationResult loadAware = routeAllConnectionsLoadAwareChannelOnly(d, pr, cr);
+    candidates.push_back({"LOAD_AWARE_NO_SPLIT", loadAware});
+
+    RoutingGenerationResult rerouted = ripUpAndRerouteOverflowChannels(d, pr, cr, loadAware);
+    candidates.push_back({"RIPUP_REROUTE_NO_SPLIT", rerouted});
+
+    RoutingGenerationResult softFt = routeAllConnectionsSoftFeedthroughNoSplit(d, pr, cr);
+    candidates.push_back({"SOFT_FEEDTHROUGH_NO_SPLIT", softFt});
+
+    RoutingGenerationResult softFtReroute = ripUpAndRerouteOverflowChannelsWithSoftFeedthrough(d, pr, cr, softFt);
+    candidates.push_back({"SOFT_FEEDTHROUGH_RIPUP_NO_SPLIT", softFtReroute});
+
+    // Try several split granularities. Smaller chunks give the router more freedom to distribute
+    // traffic, but too many chunks can increase wirelength and output size. The selector below keeps
+    // only the best result for the current placement.
+    struct SplitCfg { int chunk; int minSplit; int maxParts; };
+    vector<SplitCfg> splitCfgs = {
+        {2000, 2400, 8},
+        {1500, 1800, 10},
+        {1000, 1200, 12},
+        {750, 1000, 14},
+        {500, 800, 16}
+    };
+
+    for (const SplitCfg &sc : splitCfgs) {
+        RoutingGenerationResult split = routeAllConnectionsSplitLoadAwareChannelOnly(d, pr, cr, sc.chunk, sc.minSplit, sc.maxParts);
+        candidates.push_back({"SPLIT_LOAD_AWARE_CHUNK_" + to_string(sc.chunk), split});
+
+        RoutingGenerationResult splitReroute = ripUpAndRerouteOverflowChannels(d, pr, cr, split);
+        candidates.push_back({"SPLIT_RIPUP_REROUTE_CHUNK_" + to_string(sc.chunk), splitReroute});
+
+        RoutingGenerationResult splitSoft = routeAllConnectionsSplitSoftFeedthrough(d, pr, cr, sc.chunk, sc.minSplit, sc.maxParts);
+        candidates.push_back({"SPLIT_SOFT_FEEDTHROUGH_CHUNK_" + to_string(sc.chunk), splitSoft});
+
+        RoutingGenerationResult splitSoftReroute = ripUpAndRerouteOverflowChannelsWithSoftFeedthrough(d, pr, cr, splitSoft);
+        candidates.push_back({"SPLIT_SOFT_FEEDTHROUGH_RIPUP_CHUNK_" + to_string(sc.chunk), splitSoftReroute});
+    }
+
+    int best = 0;
+    vector<RoutingQualitySummary> summaries;
+    summaries.reserve(candidates.size());
+    for (const auto &cand : candidates) summaries.push_back(summarizeRoutingQuality(cr, cand.second));
+    for (int i = 1; i < static_cast<int>(candidates.size()); ++i) {
+        if (routingQualityBetter(summaries[i], summaries[best])) best = i;
+    }
+
+    RoutingGenerationResult chosen = candidates[best].second;
+    stringstream ss;
+    ss << "HYBRID_ROUTING_SELECTED: " << candidates[best].first;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        ss << " | " << candidates[i].first << "{" << routingQualityToString(summaries[i]) << "}";
+    }
+    chosen.warnings.insert(chosen.warnings.begin(), ss.str());
+
+    int splitPathCount = max(0, static_cast<int>(chosen.routes.size()) - static_cast<int>(d.connections.size()));
+    chosen.warnings.insert(chosen.warnings.begin(),
+        "CONNECTION_SPLITTING_SELECTED_EXTRA_PATHS: " + to_string(splitPathCount) +
+        " original_connections=" + to_string(d.connections.size()) +
+        " path_records=" + to_string(chosen.routes.size()));
+    long long selectedFtNets = 0;
+    int selectedFtBlocks = 0;
+    for (long long v : chosen.soft_ft_loads) { selectedFtNets += v; if (v > 0) selectedFtBlocks++; }
+    chosen.warnings.insert(chosen.warnings.begin(),
+        "SOFT_FEEDTHROUGH_SELECTED: soft_blocks_used=" + to_string(selectedFtBlocks) +
+        " total_ft_nets=" + to_string(selectedFtNets));
+    return chosen;
+}
+
+
+struct ChannelRouteContributor {
+    string from_name;
+    string to_name;
+    int nets = 0;
+    int channel_occurrences_in_path = 0;
+    double estimated_wirelength = 0.0;
+};
+
+struct ChannelOverflowDetail {
+    string name;
+    double lx = 0.0;
+    double ly = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+    long long load = 0;
+    double capacity = 0.0;
+    double overflow = 0.0;
+    double utilization = 0.0;
+    int path_count = 0;
+    vector<ChannelRouteContributor> contributors;
+};
+
+static bool routeUsesChannelIndex(const RoutePattern &rp, int channelNodeId) {
+    for (int node : rp.nodes) {
+        if (node == channelNodeId) return true;
+    }
+    return false;
+}
+
+static int countChannelOccurrencesInRoute(const RoutePattern &rp, int blockCount) {
+    int cnt = 0;
+    for (int node : rp.nodes) if (isChannelNode(node, blockCount)) cnt++;
+    return cnt;
+}
+
+static string contributorSummary(const vector<ChannelRouteContributor> &contributors, size_t limit = 5) {
+    if (contributors.empty()) return "none";
+    vector<ChannelRouteContributor> sorted = contributors;
+    sort(sorted.begin(), sorted.end(), [](const ChannelRouteContributor &a, const ChannelRouteContributor &b) {
+        if (a.nets != b.nets) return a.nets > b.nets;
+        return a.from_name + "->" + a.to_name < b.from_name + "->" + b.to_name;
+    });
+    ostringstream oss;
+    size_t n = min(limit, sorted.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (i) oss << ";";
+        oss << sorted[i].from_name << "->" << sorted[i].to_name << ":" << sorted[i].nets;
+    }
+    if (sorted.size() > limit) oss << ";..." << (sorted.size() - limit) << " more";
+    return oss.str();
+}
+
+static vector<ChannelOverflowDetail> buildDetailedChannelOverflowReport(const InputData &d,
+                                                                         const ChannelGenerationResult &cr,
+                                                                         const RoutingGenerationResult &rr) {
+    vector<ChannelOverflowDetail> report;
+    int blockCount = static_cast<int>(d.blocks.size());
+    report.reserve(cr.channels.size());
+
+    for (size_t i = 0; i < cr.channels.size(); ++i) {
+        const ChannelRect &ch = cr.channels[i];
+        ChannelOverflowDetail info;
+        info.name = ch.name;
+        info.lx = ch.lx;
+        info.ly = ch.ly;
+        info.width = ch.width;
+        info.height = ch.height;
+        info.load = (i < rr.channel_loads.size()) ? rr.channel_loads[i] : 0;
+        // Baseline/simple capacity model used by this self-checker:
+        // 25 nets / um times the smaller channel dimension.
+        // This is intentionally conservative and is not yet the final official density model.
+        info.capacity = 25.0 * min(ch.width, ch.height);
+        info.overflow = max(0.0, static_cast<double>(info.load) - info.capacity);
+        info.utilization = (info.capacity > EPS) ? static_cast<double>(info.load) / info.capacity : 0.0;
+
+        int channelNodeId = blockCount + static_cast<int>(i);
+        for (const RoutePattern &rp : rr.routes) {
+            if (!rp.routed) continue;
+            if (!routeUsesChannelIndex(rp, channelNodeId)) continue;
+            ChannelRouteContributor c;
+            c.from_name = d.blocks[rp.from].name;
+            c.to_name = d.blocks[rp.to].name;
+            c.nets = rp.nets;
+            c.channel_occurrences_in_path = countChannelOccurrencesInRoute(rp, blockCount);
+            c.estimated_wirelength = rp.estimated_wirelength;
+            info.contributors.push_back(c);
+        }
+        info.path_count = static_cast<int>(info.contributors.size());
+        report.push_back(info);
+    }
+
+    sort(report.begin(), report.end(), [](const ChannelOverflowDetail &a, const ChannelOverflowDetail &b) {
+        bool ao = a.overflow > EPS;
+        bool bo = b.overflow > EPS;
+        if (ao != bo) return ao > bo;
+        if (fabs(a.overflow - b.overflow) > EPS) return a.overflow > b.overflow;
+        if (fabs(a.utilization - b.utilization) > EPS) return a.utilization > b.utilization;
+        if (a.load != b.load) return a.load > b.load;
+        return a.name < b.name;
+    });
+    return report;
+}
+
+static int countOverflowChannels(const vector<ChannelOverflowDetail> &report) {
+    int cnt = 0;
+    for (const ChannelOverflowDetail &r : report) if (r.overflow > EPS) cnt++;
+    return cnt;
+}
+
+static double totalOverflowAmount(const vector<ChannelOverflowDetail> &report) {
+    double sum = 0.0;
+    for (const ChannelOverflowDetail &r : report) sum += r.overflow;
+    return sum;
+}
+
+static bool verifyAllConnectionsRouted(const InputData &d, const RoutingGenerationResult &rr, vector<string> &errors) {
+    bool ok = true;
+    map<string, long long> routedNetSum;
+    map<string, int> routedPathCount;
+
+    for (const RoutePattern &rp : rr.routes) {
+        if (!rp.routed) {
+            errors.push_back("Missing route for " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name +
+                             " piece_nets=" + to_string(rp.nets));
+            ok = false;
+            continue;
+        }
+        string key = pairKey(rp.from, rp.to);
+        routedNetSum[key] += rp.nets;
+        routedPathCount[key]++;
+    }
+
+    for (const Connection &c : d.connections) {
+        string key = pairKey(c.from, c.to);
+        long long routed = routedNetSum[key];
+        if (routed == 0) {
+            errors.push_back("Missing PATH for input connection: " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name);
+            ok = false;
+        } else if (routed != c.nets) {
+            errors.push_back("Routed net sum does not match input connection for " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name +
+                             ": routed_sum=" + to_string(routed) + " expected=" + to_string(c.nets));
+            ok = false;
+        }
+    }
+
+    set<string> expectedKeys;
+    for (const Connection &c : d.connections) expectedKeys.insert(pairKey(c.from, c.to));
+    for (const auto &kv : routedNetSum) {
+        if (!expectedKeys.count(kv.first)) {
+            errors.push_back("Routed unknown/nonzero-matrix-missing pair key=" + kv.first);
             ok = false;
         }
     }
     return ok;
 }
 
-static bool verifyRouteIntermediateChannelOnly(const InputData &d, const RoutingGenerationResult &rr, vector<string> &errors) {
+
+static bool verifyRouteIntermediateChannelOrSoftFeedthrough(const InputData &d, const RoutingGenerationResult &rr, vector<string> &errors) {
     int nBlocks = static_cast<int>(d.blocks.size());
     bool ok = true;
     for (const RoutePattern &rp : rr.routes) {
         if (!rp.routed) continue;
         if (rp.nodes.size() < 3) {
-            errors.push_back("Route " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name + " does not pass through any channel.");
+            errors.push_back("Route " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name + " does not pass through any channel or feedthrough block.");
             ok = false;
             continue;
         }
@@ -1612,10 +2724,11 @@ static bool verifyRouteIntermediateChannelOnly(const InputData &d, const Routing
             ok = false;
         }
         for (size_t i = 1; i + 1 < rp.nodes.size(); ++i) {
-            if (!isChannelNode(rp.nodes[i], nBlocks)) {
-                errors.push_back("Route " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name + " has non-channel intermediate node.");
-                ok = false;
-            }
+            int node = rp.nodes[i];
+            if (isChannelNode(node, nBlocks)) continue;
+            if (node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") continue;
+            errors.push_back("Route " + d.blocks[rp.from].name + " -> " + d.blocks[rp.to].name + " has illegal intermediate node; only CHANNEL or SOFT feedthrough block is allowed.");
+            ok = false;
         }
     }
     return ok;
@@ -1794,6 +2907,10 @@ struct CfgParsedFile {
     int declared_blocks = -1;
     int declared_channels = -1;
     int declared_paths = -1;
+    int num_blocks_line_count = 0;
+    int num_channels_line_count = 0;
+    int num_paths_line_count = 0;
+    vector<string> top_level_order;
     vector<CfgBlockRecord> blocks;
     vector<CfgChannelRecord> channels;
     vector<CfgPathRecord> paths;
@@ -1806,6 +2923,7 @@ struct CfgValidationResult {
     bool geometry_ok = false;
     bool routing_ok = false;
     bool capacity_ok = true; // capacity overflow is only a warning for now
+    bool strict_ok = false;
     bool overall_pass = false;
     long long total_routed_nets_in_cfg = 0;
     int overflow_channel_count = 0;
@@ -1911,17 +3029,21 @@ static CfgParsedFile parseCfgFileForSelfCheck(const string &cfgPath, vector<stri
                     continue;
                 }
                 parsed.saw_outline = true;
+                parsed.top_level_order.push_back("OUTLINE");
             } else if (key == "BLOCK") {
                 if (parsed.saw_block_section) formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated BLOCK section.");
                 parsed.saw_block_section = true;
+                parsed.top_level_order.push_back("BLOCK");
                 section = Section::BLOCK;
             } else if (key == "CHANNEL") {
                 if (parsed.saw_channel_section) formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated CHANNEL section.");
                 parsed.saw_channel_section = true;
+                parsed.top_level_order.push_back("CHANNEL");
                 section = Section::CHANNEL;
             } else if (key == "PATH") {
                 if (parsed.saw_path_section) formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated PATH section.");
                 parsed.saw_path_section = true;
+                parsed.top_level_order.push_back("PATH");
                 section = Section::PATH;
             } else {
                 formatErrors.push_back("Line " + to_string(lineNo) + ": unexpected top-level token: " + tok[0]);
@@ -1937,6 +3059,13 @@ static CfgParsedFile parseCfgFileForSelfCheck(const string &cfgPath, vector<stri
                 parsed.block_section_closed = true;
                 section = Section::NONE;
             } else if (key == "NUMBLOCKS") {
+                parsed.num_blocks_line_count++;
+                if (parsed.num_blocks_line_count > 1) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated NumBlocks line.");
+                }
+                if (!parsed.blocks.empty()) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": NumBlocks must appear before BLOCK records.");
+                }
                 if (tok.size() != 2 || !parseIntStrict(tok[1], parsed.declared_blocks)) {
                     formatErrors.push_back("Line " + to_string(lineNo) + ": NumBlocks must be followed by one integer.");
                 }
@@ -1968,6 +3097,13 @@ static CfgParsedFile parseCfgFileForSelfCheck(const string &cfgPath, vector<stri
                 parsed.channel_section_closed = true;
                 section = Section::NONE;
             } else if (key == "NUMCHANNELS") {
+                parsed.num_channels_line_count++;
+                if (parsed.num_channels_line_count > 1) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated NumChannels line.");
+                }
+                if (!parsed.channels.empty()) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": NumChannels must appear before CHANNEL records.");
+                }
                 if (tok.size() != 2 || !parseIntStrict(tok[1], parsed.declared_channels)) {
                     formatErrors.push_back("Line " + to_string(lineNo) + ": NumChannels must be followed by one integer.");
                 }
@@ -1999,6 +3135,13 @@ static CfgParsedFile parseCfgFileForSelfCheck(const string &cfgPath, vector<stri
                 parsed.path_section_closed = true;
                 section = Section::NONE;
             } else if (key == "NUMROUTINGPATTERN") {
+                parsed.num_paths_line_count++;
+                if (parsed.num_paths_line_count > 1) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": duplicated NumRoutingPattern line.");
+                }
+                if (!parsed.paths.empty()) {
+                    formatErrors.push_back("Line " + to_string(lineNo) + ": NumRoutingPattern must appear before PATH records.");
+                }
                 if (tok.size() != 2 || !parseIntStrict(tok[1], parsed.declared_paths)) {
                     formatErrors.push_back("Line " + to_string(lineNo) + ": NumRoutingPattern must be followed by one integer.");
                 }
@@ -2048,14 +3191,37 @@ static CfgParsedFile parseCfgFileForSelfCheck(const string &cfgPath, vector<stri
     if (parsed.saw_channel_section && !parsed.channel_section_closed) formatErrors.push_back("CHANNEL section is not closed by END CHANNEL.");
     if (parsed.saw_path_section && !parsed.path_section_closed) formatErrors.push_back("PATH section is not closed by END PATH.");
 
-    if (parsed.declared_blocks < 0) formatErrors.push_back("Missing NumBlocks line.");
+    vector<string> expectedOrder = {"OUTLINE", "BLOCK", "CHANNEL", "PATH"};
+    if (parsed.top_level_order != expectedOrder) {
+        string got;
+        for (size_t i = 0; i < parsed.top_level_order.size(); ++i) {
+            if (i) got += " -> ";
+            got += parsed.top_level_order[i];
+        }
+        formatErrors.push_back("Top-level cfg section order must be Outline -> BLOCK -> CHANNEL -> PATH. Got: " + got);
+    }
+
+    if (parsed.num_blocks_line_count == 0) formatErrors.push_back("Missing NumBlocks line.");
+    else if (parsed.declared_blocks < 0) formatErrors.push_back("NumBlocks value cannot be negative.");
     else if (parsed.declared_blocks != static_cast<int>(parsed.blocks.size())) formatErrors.push_back("NumBlocks does not match actual BLOCK records.");
-    if (parsed.declared_channels < 0) formatErrors.push_back("Missing NumChannels line.");
+    if (parsed.num_channels_line_count == 0) formatErrors.push_back("Missing NumChannels line.");
+    else if (parsed.declared_channels < 0) formatErrors.push_back("NumChannels value cannot be negative.");
     else if (parsed.declared_channels != static_cast<int>(parsed.channels.size())) formatErrors.push_back("NumChannels does not match actual CHANNEL records.");
-    if (parsed.declared_paths < 0) formatErrors.push_back("Missing NumRoutingPattern line.");
+    if (parsed.num_paths_line_count == 0) formatErrors.push_back("Missing NumRoutingPattern line.");
+    else if (parsed.declared_paths < 0) formatErrors.push_back("NumRoutingPattern value cannot be negative.");
     else if (parsed.declared_paths != static_cast<int>(parsed.paths.size())) formatErrors.push_back("NumRoutingPattern does not match actual PATH records.");
 
     return parsed;
+}
+
+static bool validCfgNameToken(const string &name) {
+    if (name.empty()) return false;
+    for (char ch : name) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        if (isspace(c)) return false;
+        if (ch == ',' || ch == ';' || ch == '#') return false;
+    }
+    return true;
 }
 
 static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const InputData &d) {
@@ -2081,6 +3247,7 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
     map<string, int> nameUseCount;
 
     for (const CfgBlockRecord &b : p.blocks) {
+        if (!validCfgNameToken(b.name)) vr.format_errors.push_back("Line " + to_string(b.line_no) + ": invalid BLOCK name token: " + b.name);
         nameUseCount[b.name]++;
         if (cfgBlocks.count(b.name)) {
             vr.geometry_errors.push_back("Duplicated BLOCK name in cfg: " + b.name);
@@ -2094,6 +3261,9 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
         }
     }
 
+    if (p.blocks.size() != d.blocks.size()) {
+        vr.geometry_errors.push_back("CFG BLOCK record count does not exactly equal input BLOCK count.");
+    }
     for (const Block &bi : d.blocks) {
         if (!cfgBlocks.count(bi.name)) vr.geometry_errors.push_back("Missing BLOCK from cfg: " + bi.name);
     }
@@ -2110,8 +3280,8 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
             }
         }
         if (bi.type == "SOFT") {
-            if (fabs(area - bi.area) > max(1.0, bi.area) * 1e-4) {
-                vr.geometry_errors.push_back(bi.name + " SOFT area mismatch in cfg.");
+            if (area + max(1.0, bi.area) * 1e-4 < bi.area) {
+                vr.geometry_errors.push_back(bi.name + " SOFT area is smaller than input area in cfg.");
             }
             if (aspect + 1e-5 < bi.ar_min || aspect - 1e-5 > bi.ar_max) {
                 vr.geometry_errors.push_back(bi.name + " SOFT aspect ratio outside input range in cfg.");
@@ -2143,6 +3313,7 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
     }
 
     for (const CfgChannelRecord &c : p.channels) {
+        if (!validCfgNameToken(c.name)) vr.format_errors.push_back("Line " + to_string(c.line_no) + ": invalid CHANNEL name token: " + c.name);
         nameUseCount[c.name]++;
         if (cfgChannels.count(c.name)) {
             vr.geometry_errors.push_back("Duplicated CHANNEL name in cfg: " + c.name);
@@ -2172,6 +3343,12 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
         }
     }
 
+    for (const auto &kv : nameUseCount) {
+        if (kv.second > 1) {
+            vr.format_errors.push_back("Rectangle name is not globally unique across BLOCK/CHANNEL records: " + kv.first);
+        }
+    }
+
     map<string, Rect> rectByName;
     map<string, string> rectKind; // BLOCK or CHANNEL
     map<string, int> rectBlockIndex;
@@ -2186,7 +3363,9 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
     }
 
     map<string, int> routedPairCount;
+    map<string, long long> routedPairNetSum;
     map<string, long long> channelLoads;
+    map<string, long long> softFtLoads;
 
     for (const CfgPathRecord &path : p.paths) {
         vr.total_routed_nets_in_cfg += path.nets;
@@ -2197,6 +3376,11 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
 
         const string &srcName = path.steps.front().rect_name;
         const string &dstName = path.steps.back().rect_name;
+        for (const PathStep &s : path.steps) {
+            if (!validCfgNameToken(s.rect_name)) {
+                vr.format_errors.push_back("Line " + to_string(path.line_no) + ": invalid rectangle name token in PATH: " + s.rect_name);
+            }
+        }
         if (!rectByName.count(srcName)) {
             vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": source rectangle not defined: " + srcName);
             continue;
@@ -2215,12 +3399,24 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
             vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": PATH endpoint block not found in input.");
             continue;
         }
+        if (srcIdx == dstIdx) {
+            vr.warnings.push_back("Line " + to_string(path.line_no) + ": diagonal/self connection routed for " + srcName + "; accepted because the input matrix contains it.");
+        }
+        if (!edgeAllowedByPortConstraint(d.blocks[srcIdx], path.steps.front().edge)) {
+            vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": source edge violates PORT EDGE constraint for " + srcName);
+        }
+        if (!edgeAllowedByPortConstraint(d.blocks[dstIdx], path.steps.back().edge)) {
+            vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": destination edge violates PORT EDGE constraint for " + dstName);
+        }
+        if (path.nets <= 0) {
+            vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": PATH net_count must be positive.");
+        }
         if (d.conn[srcIdx][dstIdx] <= 0) {
             vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": PATH endpoint pair is not a nonzero input connection: " + srcName + " -> " + dstName);
-        } else if (path.nets != d.conn[srcIdx][dstIdx]) {
-            vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": PATH net_count does not match input matrix for " + srcName + " -> " + dstName);
         }
-        routedPairCount[pairKey(srcIdx, dstIdx)]++;
+        string routedKey = pairKey(srcIdx, dstIdx);
+        routedPairCount[routedKey]++;
+        routedPairNetSum[routedKey] += path.nets;
 
         for (const PathStep &s : path.steps) {
             if (!rectByName.count(s.rect_name)) {
@@ -2234,18 +3430,49 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
         for (size_t i = 1; i + 1 < path.steps.size(); i += 2) {
             if (path.steps[i].rect_name != path.steps[i + 1].rect_name) {
                 vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": intermediate rectangle is not one-in-one-out near " + path.steps[i].rect_name + ".");
+            } else {
+                const string &midName = path.steps[i].rect_name;
+                if (rectKind.count(midName) && rectKind[midName] != "CHANNEL") {
+                    bool okSoftFt = false;
+                    if (rectKind[midName] == "BLOCK" && rectBlockIndex.count(midName)) {
+                        int midIdx = rectBlockIndex[midName];
+                        okSoftFt = (d.blocks[midIdx].type == "SOFT");
+                    }
+                    if (!okSoftFt) {
+                        vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": paired intermediate rectangle is neither CHANNEL nor SOFT feedthrough block: " + midName);
+                    }
+                }
+                if (path.steps[i].edge == path.steps[i + 1].edge) {
+                    vr.warnings.push_back("Line " + to_string(path.line_no) + ": intermediate rectangle enters and exits on the same edge: " + midName + "; accepted but marked as a routing-quality warning.");
+                }
             }
         }
 
         map<string, bool> touchedChannels;
+        map<string, int> touchedSoftFtCount;
         for (size_t i = 1; i + 1 < path.steps.size(); ++i) {
             const string &nm = path.steps[i].rect_name;
-            if (rectKind.count(nm) && rectKind[nm] != "CHANNEL") {
-                vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": intermediate rectangle is not CHANNEL-only: " + nm);
+            if (!rectKind.count(nm)) continue;
+            if (rectKind[nm] == "CHANNEL") {
+                touchedChannels[nm] = true;
+            } else {
+                bool okSoftFt = false;
+                if (rectKind[nm] == "BLOCK" && rectBlockIndex.count(nm)) {
+                    int midIdx = rectBlockIndex[nm];
+                    okSoftFt = (d.blocks[midIdx].type == "SOFT" && nm != srcName && nm != dstName);
+                }
+                if (!okSoftFt) {
+                    vr.routing_errors.push_back("Line " + to_string(path.line_no) + ": intermediate rectangle is neither CHANNEL nor SOFT feedthrough block: " + nm);
+                } else {
+                    touchedSoftFtCount[nm]++;
+                }
             }
-            if (rectKind.count(nm) && rectKind[nm] == "CHANNEL") touchedChannels[nm] = true;
         }
         for (const auto &kv : touchedChannels) channelLoads[kv.first] += path.nets;
+        for (const auto &kv : touchedSoftFtCount) {
+            int occurrences = max(1, kv.second / 2);
+            softFtLoads[kv.first] += static_cast<long long>(path.nets) * occurrences;
+        }
 
         for (size_t i = 0; i + 1 < path.steps.size(); i += 2) {
             const PathStep &aStep = path.steps[i];
@@ -2264,16 +3491,27 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
         }
     }
 
-    if (static_cast<int>(p.paths.size()) != static_cast<int>(d.connections.size())) {
-        vr.routing_errors.push_back("PATH record count does not equal nonzero input connection count.");
-    }
+    // Connection splitting is allowed in our generated cfg: multiple PATH records may share the
+    // same source/target pair as long as their net_count values sum exactly to the input matrix value.
     for (const Connection &c : d.connections) {
         string key = pairKey(c.from, c.to);
         int seen = routedPairCount[key];
+        long long routedSum = routedPairNetSum[key];
         if (seen == 0) {
             vr.routing_errors.push_back("Missing PATH for input connection: " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name);
+        } else if (routedSum != c.nets) {
+            vr.routing_errors.push_back("PATH net_count sum does not match input matrix for " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name +
+                                        ": routed_sum=" + to_string(routedSum) + " expected=" + to_string(c.nets));
         } else if (seen > 1) {
-            vr.routing_errors.push_back("Duplicated PATH for input connection: " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name);
+            vr.warnings.push_back("Connection was split into multiple PATH records: " + d.blocks[c.from].name + " -> " + d.blocks[c.to].name +
+                                  " pieces=" + to_string(seen));
+        }
+    }
+    set<string> expectedPathKeys;
+    for (const Connection &c : d.connections) expectedPathKeys.insert(pairKey(c.from, c.to));
+    for (const auto &kv : routedPairNetSum) {
+        if (!expectedPathKeys.count(kv.first)) {
+            vr.routing_errors.push_back("PATH exists for a pair not present in the input matrix: key=" + kv.first);
         }
     }
     if (vr.total_routed_nets_in_cfg != totalDirectedNets(d)) {
@@ -2289,18 +3527,337 @@ static CfgValidationResult validateGeneratedCfgFile(const string &cfgPath, const
             vr.capacity_warnings.push_back("Channel capacity warning: " + c.name + " load=" + to_string(load) + " simple_capacity=" + fmt(capacity));
         }
     }
+    for (const auto &kv : softFtLoads) {
+        if (kv.second > 0) {
+            vr.warnings.push_back("Soft feedthrough used: " + kv.first + " ft_nets=" + to_string(kv.second) +
+                                  " (debug warning only; final scoring should account for FT area/conversion). ");
+        }
+    }
 
     vr.format_ok = vr.format_errors.empty();
     vr.geometry_ok = vr.geometry_errors.empty();
     vr.routing_ok = vr.routing_errors.empty();
-    vr.overall_pass = vr.format_ok && vr.geometry_ok && vr.routing_ok;
+    vr.strict_ok = vr.format_ok && vr.geometry_ok && vr.routing_ok;
+    vr.overall_pass = vr.strict_ok;
     if (!vr.capacity_ok) {
         vr.warnings.push_back("Capacity overflow exists in the simple self-check; treated as warning for now.");
     }
     return vr;
 }
 
-static void printStep7CfgVerification(const string &filename,
+
+struct PlacementRoutingAttempt {
+    string name;
+    FullPlacementResult placement;
+    ChannelGenerationResult channels;
+    RoutingGenerationResult routing;
+    double overflow_amount = 0.0;
+    int overflow_channels = 0;
+    double estimated_cost = 0.0;
+    bool valid_for_selection = false;
+};
+
+static bool placementBasicOkForSelection(const InputData &d, const FullPlacementResult &pr) {
+    if (!pr.errors.empty()) return false;
+    for (size_t i = 0; i < d.blocks.size(); ++i) if (!pr.placements[i].placed) return false;
+    vector<string> tmp;
+    return verifyAllInsideOutline(d, pr, tmp) && verifyNoBlockOverlap(d, pr, tmp);
+}
+
+static bool betterPlacementRoutingAttempt(const PlacementRoutingAttempt &a, const PlacementRoutingAttempt &b) {
+    if (a.valid_for_selection != b.valid_for_selection) return a.valid_for_selection > b.valid_for_selection;
+    if (a.routing.unrouted_count != b.routing.unrouted_count) return a.routing.unrouted_count < b.routing.unrouted_count;
+    if (a.routing.unrouted_nets != b.routing.unrouted_nets) return a.routing.unrouted_nets < b.routing.unrouted_nets;
+    if (fabs(a.overflow_amount - b.overflow_amount) > 1e-4) return a.overflow_amount < b.overflow_amount;
+    if (a.overflow_channels != b.overflow_channels) return a.overflow_channels < b.overflow_channels;
+    if (fabs(a.routing.total_estimated_wirelength - b.routing.total_estimated_wirelength) > 1e-4) return a.routing.total_estimated_wirelength < b.routing.total_estimated_wirelength;
+    if (fabs(a.estimated_cost - b.estimated_cost) > 1e-4) return a.estimated_cost < b.estimated_cost;
+    return a.name < b.name;
+}
+
+static vector<PlacementStrategyConfig> demandAwarePlacementStrategies() {
+    vector<PlacementStrategyConfig> cfgs;
+    PlacementStrategyConfig baseline;
+    baseline.name = "BASELINE_PLACEMENT_FIXED_GAP";
+    baseline.demand_aware = false;
+    baseline.base_gap = 20.0;
+    baseline.extra_gap = 0.0;
+    baseline.connectivity_weight = 1.0;
+    baseline.center_weight = 0.0;
+    baseline.compact_weight = 1.0;
+    cfgs.push_back(baseline);
+
+    PlacementStrategyConfig compact;
+    compact.name = "DEMAND_AWARE_COMPACT";
+    compact.demand_aware = true;
+    compact.base_gap = 16.0;
+    compact.extra_gap = 45.0;
+    compact.connectivity_weight = 1.0;
+    compact.center_weight = 0.15;
+    compact.compact_weight = 1.0;
+    cfgs.push_back(compact);
+
+    PlacementStrategyConfig balanced;
+    balanced.name = "DEMAND_AWARE_BALANCED";
+    balanced.demand_aware = true;
+    balanced.base_gap = 24.0;
+    balanced.extra_gap = 90.0;
+    balanced.connectivity_weight = 0.85;
+    balanced.center_weight = 0.35;
+    balanced.compact_weight = 0.8;
+    cfgs.push_back(balanced);
+
+    PlacementStrategyConfig spacious;
+    spacious.name = "DEMAND_AWARE_SPACIOUS";
+    spacious.demand_aware = true;
+    spacious.base_gap = 32.0;
+    spacious.extra_gap = 140.0;
+    spacious.connectivity_weight = 0.75;
+    spacious.center_weight = 0.45;
+    spacious.compact_weight = 0.65;
+    cfgs.push_back(spacious);
+    return cfgs;
+}
+
+static PlacementRoutingAttempt makePlacementRoutingAttempt(const InputData &d,
+                                                           const ShapeResult &shapes,
+                                                           const EdgePlacementResult &edgePlacement,
+                                                           const PlacementStrategyConfig &cfg) {
+    PlacementRoutingAttempt a;
+    a.name = cfg.name;
+    a.placement = placeAllBlocksAfterEdgesWithStrategy(d, shapes, edgePlacement, cfg);
+    if (placementBasicOkForSelection(d, a.placement)) {
+        a.channels = generateVerticalSliceChannels(d, a.placement);
+        if (a.channels.errors.empty()) {
+            a.routing = routeAllConnectionsHybridLoadAwareChannelOnly(d, a.placement, a.channels);
+            vector<ChannelOverflowDetail> report = buildDetailedChannelOverflowReport(d, a.channels, a.routing);
+            a.overflow_amount = totalOverflowAmount(report);
+            a.overflow_channels = countOverflowChannels(report);
+            a.estimated_cost = d.outline_width * d.outline_height + d.alpha * a.routing.total_estimated_wirelength;
+            a.valid_for_selection = a.routing.errors.empty();
+        }
+    }
+    return a;
+}
+
+static PlacementRoutingAttempt chooseDemandAwarePlacementAndRouting(const InputData &d,
+                                                                    const ShapeResult &shapes,
+                                                                    const EdgePlacementResult &edgePlacement) {
+    vector<PlacementRoutingAttempt> attempts;
+    for (const PlacementStrategyConfig &cfg : demandAwarePlacementStrategies()) {
+        attempts.push_back(makePlacementRoutingAttempt(d, shapes, edgePlacement, cfg));
+    }
+    int best = 0;
+    for (int i = 1; i < static_cast<int>(attempts.size()); ++i) {
+        if (betterPlacementRoutingAttempt(attempts[i], attempts[best])) best = i;
+    }
+    PlacementRoutingAttempt chosen = attempts[best];
+
+    stringstream ss;
+    ss << "PLACEMENT_ROUTING_SELECTED: " << chosen.name
+       << " overflow=" << fmt(chosen.overflow_amount)
+       << " overflow_channels=" << chosen.overflow_channels
+       << " unrouted=" << chosen.routing.unrouted_count
+       << " wirelength=" << fmt(chosen.routing.total_estimated_wirelength);
+    chosen.placement.warnings.push_back(ss.str());
+    chosen.placement.warnings.push_back("PLACEMENT_ROUTING_COMPARISON: name,valid,unrouted,total_overflow,overflow_channels,wirelength,channel_count");
+    for (const PlacementRoutingAttempt &a : attempts) {
+        stringstream row;
+        row << "  " << a.name << "," << (a.valid_for_selection ? "YES" : "NO")
+            << "," << a.routing.unrouted_count
+            << "," << fmt(a.overflow_amount)
+            << "," << a.overflow_channels
+            << "," << fmt(a.routing.total_estimated_wirelength)
+            << "," << a.channels.channels.size();
+        chosen.placement.warnings.push_back(row.str());
+    }
+    return chosen;
+}
+
+
+struct FtResizeEntry {
+    string block_name;
+    long long pass1_ft_nets = 0;
+    long long budget_ft_nets = 0;
+    long long final_ft_nets = 0;
+    double conversion_rate = 0.0;
+    double grow_per_side = 0.0;
+    double old_width = 0.0;
+    double old_height = 0.0;
+    double new_width = 0.0;
+    double new_height = 0.0;
+    double old_area = 0.0;
+    double new_area = 0.0;
+    double area_delta = 0.0;
+    bool aspect_ok = true;
+    bool outline_fit_ok = true;
+    bool final_ft_covered_by_budget = true;
+};
+
+struct FtResizeResult {
+    ShapeResult resized_shapes;
+    vector<FtResizeEntry> entries;
+    long long pass1_total_ft_nets = 0;
+    long long budget_total_ft_nets = 0;
+    long long final_total_ft_nets = 0;
+    double total_area_delta = 0.0;
+    vector<string> warnings;
+    vector<string> errors;
+};
+
+struct TwoPassFtResult {
+    ShapeResult resized_shapes;
+    PlacementRoutingAttempt pass1;
+    PlacementRoutingAttempt pass2;
+    FtResizeResult resize;
+};
+
+static int ftConversionBucketIndex(long long nets) {
+    if (nets <= 0) return -1;
+    if (nets <= 3000) return 0;
+    if (nets <= 6000) return 1;
+    if (nets <= 9000) return 2;
+    return 3;
+}
+
+static long long ftBudgetNetsFromPass1(long long pass1Nets) {
+    // The PDF example applies the conversion rate selected by the net-count bucket,
+    // but multiplies by the actual feedthrough net count, not by the bucket upper bound.
+    return max(0LL, pass1Nets);
+}
+
+static double ftConversionRateForBudget(const Block &b, long long budgetNets) {
+    int bi = ftConversionBucketIndex(budgetNets);
+    if (bi < 0) return 0.0;
+    if (bi >= 0 && bi < static_cast<int>(b.ft_conversion.size())) return b.ft_conversion[bi];
+    return 1.0;
+}
+
+static FtResizeResult applyTwoPassFtResizeFromPass1Loads(const InputData &d,
+                                                         const ShapeResult &baseShapes,
+                                                         const vector<long long> &pass1FtLoads) {
+    FtResizeResult fr;
+    fr.resized_shapes = baseShapes;
+    fr.entries.clear();
+
+    for (size_t i = 0; i < d.blocks.size(); ++i) {
+        const Block &b = d.blocks[i];
+        if (b.type != "SOFT") continue;
+        long long pass1Nets = (i < pass1FtLoads.size()) ? pass1FtLoads[i] : 0;
+        long long budgetNets = ftBudgetNetsFromPass1(pass1Nets);
+        double rate = ftConversionRateForBudget(b, budgetNets);
+
+        FtResizeEntry e;
+        e.block_name = b.name;
+        e.pass1_ft_nets = pass1Nets;
+        e.budget_ft_nets = budgetNets;
+        e.conversion_rate = rate;
+        e.old_width = baseShapes.shapes[i].width;
+        e.old_height = baseShapes.shapes[i].height;
+        e.old_area = e.old_width * e.old_height;
+        e.new_width = e.old_width;
+        e.new_height = e.old_height;
+        e.new_area = e.old_area;
+
+        if (budgetNets > 0) {
+            double extraTotal = (static_cast<double>(budgetNets) / 25.0) * rate;
+            e.grow_per_side = extraTotal / 2.0;
+            e.new_width = e.old_width + e.grow_per_side;
+            e.new_height = e.old_height + e.grow_per_side;
+            e.new_area = e.new_width * e.new_height;
+            e.area_delta = e.new_area - e.old_area;
+
+            BlockShape ns = fr.resized_shapes.shapes[i];
+            ns.width = e.new_width;
+            ns.height = e.new_height;
+            ns.area = e.new_area;
+            ns.aspect = (ns.height > EPS ? ns.width / ns.height : 0.0);
+            ns.fixed_dim_ok = true;
+            ns.area_ok = ns.area + max(1.0, b.area) * 1e-4 >= b.area;
+            ns.aspect_ok = b.has_ar && ns.aspect + EPS >= b.ar_min && ns.aspect <= b.ar_max + EPS;
+            ns.single_outline_fit_ok = (ns.width <= d.outline_width + EPS && ns.height <= d.outline_height + EPS);
+            fr.resized_shapes.shapes[i] = ns;
+            e.aspect_ok = ns.aspect_ok;
+            e.outline_fit_ok = ns.single_outline_fit_ok;
+            fr.total_area_delta += e.area_delta;
+        }
+
+        fr.pass1_total_ft_nets += pass1Nets;
+        fr.budget_total_ft_nets += budgetNets;
+        if (!e.aspect_ok) fr.errors.push_back(b.name + " FT-resized SOFT aspect ratio is illegal: aspect=" + fmt(fr.resized_shapes.shapes[i].aspect));
+        if (!e.outline_fit_ok) fr.errors.push_back(b.name + " FT-resized SOFT shape cannot fit inside outline individually: " + fmt(e.new_width) + "x" + fmt(e.new_height));
+        if (budgetNets > 0 || pass1Nets > 0) fr.entries.push_back(e);
+    }
+
+    fr.warnings.push_back("FT_RESIZE_METHOD: two-pass estimate from Pass-1 SOFT feedthrough loads; conversion rate comes from the FT bucket, size increase uses actual Pass-1 FT net count.");
+    return fr;
+}
+
+static void updateFtResizeResultWithFinalLoads(const InputData &d,
+                                               const vector<long long> &finalFtLoads,
+                                               FtResizeResult &fr) {
+    map<string, size_t> entryIndex;
+    for (size_t ei = 0; ei < fr.entries.size(); ++ei) entryIndex[fr.entries[ei].block_name] = ei;
+    fr.final_total_ft_nets = 0;
+    for (size_t i = 0; i < d.blocks.size(); ++i) {
+        if (d.blocks[i].type != "SOFT") continue;
+        long long finalNets = (i < finalFtLoads.size()) ? finalFtLoads[i] : 0;
+        fr.final_total_ft_nets += finalNets;
+        auto it = entryIndex.find(d.blocks[i].name);
+        if (it == entryIndex.end()) {
+            if (finalNets > 0) {
+                FtResizeEntry e;
+                e.block_name = d.blocks[i].name;
+                e.pass1_ft_nets = 0;
+                e.budget_ft_nets = 0;
+                e.final_ft_nets = finalNets;
+                e.old_width = fr.resized_shapes.shapes[i].width;
+                e.old_height = fr.resized_shapes.shapes[i].height;
+                e.new_width = e.old_width;
+                e.new_height = e.old_height;
+                e.old_area = e.old_width * e.old_height;
+                e.new_area = e.old_area;
+                e.final_ft_covered_by_budget = false;
+                fr.entries.push_back(e);
+                fr.warnings.push_back(d.blocks[i].name + " has final-pass FT nets but had zero Pass-1 FT budget; a third pass may improve consistency.");
+            }
+        } else {
+            FtResizeEntry &e = fr.entries[it->second];
+            e.final_ft_nets = finalNets;
+            e.final_ft_covered_by_budget = (finalNets <= e.budget_ft_nets);
+            if (!e.final_ft_covered_by_budget) {
+                fr.warnings.push_back(e.block_name + " final FT nets=" + to_string(finalNets) + " exceed Pass-1 budget=" + to_string(e.budget_ft_nets) + "; a third pass would resize it further.");
+            }
+        }
+    }
+}
+
+static TwoPassFtResult chooseTwoPassFtResizedPlacementAndRouting(const InputData &d,
+                                                                 const ShapeResult &baseShapes,
+                                                                 const EdgePlacementResult &edgePlacement) {
+    TwoPassFtResult t;
+    t.pass1 = chooseDemandAwarePlacementAndRouting(d, baseShapes, edgePlacement);
+    t.resize = applyTwoPassFtResizeFromPass1Loads(d, baseShapes, t.pass1.routing.soft_ft_loads);
+    t.resized_shapes = t.resize.resized_shapes;
+    t.pass2 = chooseDemandAwarePlacementAndRouting(d, t.resized_shapes, edgePlacement);
+    updateFtResizeResultWithFinalLoads(d, t.pass2.routing.soft_ft_loads, t.resize);
+
+    t.pass2.placement.warnings.push_back("TWO_PASS_FT_RESIZE_PASS1_SELECTED: " + t.pass1.name +
+        " ft_nets=" + to_string(t.resize.pass1_total_ft_nets) +
+        " overflow=" + fmt(t.pass1.overflow_amount) +
+        " wl=" + fmt(t.pass1.routing.total_estimated_wirelength));
+    t.pass2.placement.warnings.push_back("TWO_PASS_FT_RESIZE_PASS2_SELECTED: " + t.pass2.name +
+        " final_ft_nets=" + to_string(t.resize.final_total_ft_nets) +
+        " budget_ft_nets=" + to_string(t.resize.budget_total_ft_nets) +
+        " added_soft_area=" + fmt(t.resize.total_area_delta) +
+        " overflow=" + fmt(t.pass2.overflow_amount) +
+        " wl=" + fmt(t.pass2.routing.total_estimated_wirelength));
+    for (const string &w : t.resize.warnings) t.pass2.placement.warnings.push_back(w);
+    for (const string &e : t.resize.errors) t.pass2.placement.errors.push_back(e);
+    return t;
+}
+
+static void printStep16CfgVerification(const string &filename,
                                       const InputData &d,
                                       const ShapeResult &sr,
                                       const EdgePlacementResult &er,
@@ -2308,7 +3865,8 @@ static void printStep7CfgVerification(const string &filename,
                                       const ChannelGenerationResult &cr,
                                       const RoutingGenerationResult &rr,
                                       const CfgWriteResult &cfg,
-                                      const CfgValidationResult &cv) {
+                                      const CfgValidationResult &cv,
+                                      const FtResizeResult &fr) {
     vector<string> verifyErrors;
 
     bool parserOk = d.errors.empty();
@@ -2331,20 +3889,20 @@ static void printStep7CfgVerification(const string &filename,
     bool placementOk = er.errors.empty() && pr.errors.empty() && allPlaced && insideOk && edgeConstraintOk && noOverlapOk;
 
     bool routedAllOk = verifyAllConnectionsRouted(d, rr, verifyErrors);
-    bool channelOnlyOk = verifyRouteIntermediateChannelOnly(d, rr, verifyErrors);
+    bool channelOrSoftFtOk = verifyRouteIntermediateChannelOrSoftFeedthrough(d, rr, verifyErrors);
     bool pathFormatOk = verifyPathStepFormat(d, cr, rr, verifyErrors);
     bool netCountOk = verifyRoutedNetCount(d, rr, verifyErrors);
-    bool routingOk = rr.errors.empty() && routedAllOk && channelOnlyOk && pathFormatOk && netCountOk;
+    bool routingOk = rr.errors.empty() && routedAllOk && channelOrSoftFtOk && pathFormatOk && netCountOk;
 
     double outlineArea = d.outline_width * d.outline_height;
     double estimatedCost = outlineArea + d.alpha * rr.total_estimated_wirelength;
 
     cout << "==============================\n";
-    cout << "PROGRAM_VERSION: STEP_8_CFG_SELF_CHECKER\n";
+    cout << "PROGRAM_VERSION: STEP_16_TWO_PASS_FT_RESIZE\n";
     cout << "INPUT_FILE: " << filename << "\n";
     cout << "CFG_OUTPUT_FILE: " << cfg.output_path << "\n";
     cout << "CFG_WRITTEN: " << (cfg.written ? "YES" : "NO") << "\n";
-    cout << "VERIFY_STEP: 8 - generate output .cfg file, then run internal validity self-checker\n";
+    cout << "VERIFY_STEP: 16 - two-pass SOFT feedthrough size recalculation, then re-placement/re-routing\n";
     cout << "BLOCK_COUNT: " << d.blocks.size()
          << "  SOFT: " << countType(d, "SOFT")
          << "  MACRO: " << countType(d, "MACRO")
@@ -2352,6 +3910,7 @@ static void printStep7CfgVerification(const string &filename,
     cout << "OUTLINE_MAX: " << fmt(d.outline_width) << " x " << fmt(d.outline_height) << "\n";
     cout << "OUTLINE_AREA: " << fmt(outlineArea) << "\n";
     cout << "TOTAL_PLACED_BLOCK_AREA: " << fmt(totalPlacedArea(d, pr)) << "\n";
+    cout << "PLACEMENT_STRATEGY: " << (pr.strategy_name.empty() ? string("UNKNOWN") : pr.strategy_name) << "\n";
     cout << "CHANNEL_COUNT: " << cr.channels.size() << "\n";
     cout << "TOTAL_CHANNEL_AREA: " << fmt(cr.channel_area) << "\n";
     cout << "ALPHA: " << fmt(d.alpha) << "\n";
@@ -2372,7 +3931,7 @@ static void printStep7CfgVerification(const string &filename,
     cout << "  CHANNEL_GENERATION_CHECK: " << (channelOk ? "PASS" : "FAIL") << "\n";
     cout << "  ROUTING_GENERATION_CHECK: " << (rr.errors.empty() ? "PASS" : "FAIL") << "\n";
     cout << "  ROUTING_ALL_CONNECTIONS_ROUTED_CHECK: " << (routedAllOk ? "PASS" : "FAIL") << "\n";
-    cout << "  ROUTING_INTERMEDIATE_CHANNEL_ONLY_CHECK: " << (channelOnlyOk ? "PASS" : "FAIL") << "\n";
+    cout << "  ROUTING_INTERMEDIATE_CHANNEL_OR_SOFT_FT_CHECK: " << (channelOrSoftFtOk ? "PASS" : "FAIL") << "\n";
     cout << "  ROUTING_PATH_EDGE_FORMAT_CHECK: " << (pathFormatOk ? "PASS" : "FAIL") << "\n";
     cout << "  ROUTING_NET_COUNT_CHECK: " << (netCountOk ? "PASS" : "FAIL") << "\n";
     cout << "  CFG_GENERATION_CHECK: " << ((cfg.written && cfg.errors.empty()) ? "PASS" : "FAIL") << "\n";
@@ -2380,6 +3939,7 @@ static void printStep7CfgVerification(const string &filename,
     cout << "  CFG_GEOMETRY_SELF_CHECK: " << (cv.geometry_ok ? "PASS" : "FAIL") << "\n";
     cout << "  CFG_ROUTING_SELF_CHECK: " << (cv.routing_ok ? "PASS" : "FAIL") << "\n";
     cout << "  CFG_CAPACITY_SELF_CHECK: " << (cv.capacity_ok ? "PASS" : "WARN") << "\n";
+    cout << "  CFG_STRICT_VALIDITY_SELF_CHECK: " << (cv.strict_ok ? "PASS" : "FAIL") << "\n";
 
     cout << "\nCFG_OUTPUT_SUMMARY:\n";
     cout << "  output_file: " << cfg.output_path << "\n";
@@ -2392,6 +3952,7 @@ static void printStep7CfgVerification(const string &filename,
     cout << "  geometry_check: " << (cv.geometry_ok ? "PASS" : "FAIL") << "\n";
     cout << "  routing_check: " << (cv.routing_ok ? "PASS" : "FAIL") << "\n";
     cout << "  capacity_check: " << (cv.capacity_ok ? "PASS" : "WARN") << "\n";
+    cout << "  strict_validity_check: " << (cv.strict_ok ? "PASS" : "FAIL") << "\n";
     cout << "  cfg_total_routed_nets: " << cv.total_routed_nets_in_cfg << "\n";
     cout << "  overflow_channel_count_simple: " << cv.overflow_channel_count << "\n";
 
@@ -2409,26 +3970,118 @@ static void printStep7CfgVerification(const string &filename,
     }
 
     cout << "\nROUTE_NODE_SUMMARY:\n";
-    cout << "  from,to,nets,node_count,channel_count,estimated_wirelength,status\n";
+    cout << "  from,to,nets,node_count,channel_count/softft_count,estimated_wirelength,status\n";
     for (const RoutePattern &rp : rr.routes) {
         int chCount = 0;
-        for (int node : rp.nodes) if (isChannelNode(node, static_cast<int>(d.blocks.size()))) chCount++;
+        int softFtCount = 0;
+        int nBlocksLocal = static_cast<int>(d.blocks.size());
+        for (size_t ni = 0; ni < rp.nodes.size(); ++ni) {
+            int node = rp.nodes[ni];
+            if (isChannelNode(node, nBlocksLocal)) chCount++;
+            else if (ni > 0 && ni + 1 < rp.nodes.size() && node >= 0 && node < nBlocksLocal && d.blocks[node].type == "SOFT") softFtCount++;
+        }
         cout << "  " << d.blocks[rp.from].name << "," << d.blocks[rp.to].name << "," << rp.nets << ","
-             << rp.nodes.size() << "," << chCount << "," << fmt(rp.estimated_wirelength) << ","
+             << rp.nodes.size() << "," << chCount << "/softft=" << softFtCount << "," << fmt(rp.estimated_wirelength) << ","
              << (rp.routed ? (rp.used_port_relaxation ? "ROUTED_PORT_RELAXED" : "ROUTED") : "UNROUTED") << "\n";
     }
 
-    cout << "\nCHANNEL_LOAD_REPORT_SIMPLE:\n";
-    cout << "  # This is only a simple total-net load per channel, not the final official overflow check yet.\n";
-    cout << "  channel,lx,ly,width,height,total_passing_nets,pessimistic_capacity_25_per_um_min_dim\n";
-    for (size_t i = 0; i < cr.channels.size(); ++i) {
-        const ChannelRect &c = cr.channels[i];
-        double cap = 25.0 * min(c.width, c.height);
-        cout << "  " << c.name << "," << fmt(c.lx) << "," << fmt(c.ly) << ","
-             << fmt(c.width) << "," << fmt(c.height) << "," << rr.channel_loads[i] << "," << fmt(cap) << "\n";
+    vector<ChannelOverflowDetail> overflowReport = buildDetailedChannelOverflowReport(d, cr, rr);
+    int overflowCount = countOverflowChannels(overflowReport);
+    double totalOverflow = totalOverflowAmount(overflowReport);
+
+    cout << "\nSOFT_FEEDTHROUGH_SUMMARY:\n";
+    long long totalSoftFt = 0;
+    int softFtBlockCount = 0;
+    if (!rr.soft_ft_loads.empty()) {
+        for (size_t bi = 0; bi < d.blocks.size() && bi < rr.soft_ft_loads.size(); ++bi) {
+            if (d.blocks[bi].type == "SOFT" && rr.soft_ft_loads[bi] > 0) {
+                totalSoftFt += rr.soft_ft_loads[bi];
+                softFtBlockCount++;
+            }
+        }
+    }
+    cout << "  soft_blocks_used=" << softFtBlockCount << " total_soft_ft_nets=" << totalSoftFt << "\n";
+    if (!rr.soft_ft_loads.empty()) {
+        for (size_t bi = 0; bi < d.blocks.size() && bi < rr.soft_ft_loads.size(); ++bi) {
+            if (d.blocks[bi].type == "SOFT" && rr.soft_ft_loads[bi] > 0) {
+                cout << "  " << d.blocks[bi].name << " ft_nets=" << rr.soft_ft_loads[bi]
+                     << " capacity_estimate=" << fmt(softFeedthroughCapacityEstimate(d, pr, static_cast<int>(bi))) << "\n";
+            }
+        }
     }
 
-    if (!d.warnings.empty() || !sr.warnings.empty() || !er.warnings.empty() || !pr.warnings.empty() || !cr.warnings.empty() || !rr.warnings.empty() || !cfg.warnings.empty() || !cv.warnings.empty() || !cv.capacity_warnings.empty()) {
+
+    cout << "\nFT_SIZE_RECALCULATION_REPORT:\n";
+    cout << "  method: two-pass Pass-1 FT load -> resize SOFT blocks -> Pass-2 place/route/output\n";
+    cout << "  pass1_total_ft_nets=" << fr.pass1_total_ft_nets
+         << " budget_total_ft_nets=" << fr.budget_total_ft_nets
+         << " final_total_ft_nets=" << fr.final_total_ft_nets
+         << " total_soft_area_delta=" << fmt(fr.total_area_delta) << "\n";
+    cout << "  block,pass1_ft,budget_ft,final_ft,rate,grow_per_side,old_w,old_h,new_w,new_h,area_delta,aspect_ok,outline_fit,final_covered\n";
+    if (fr.entries.empty()) {
+        cout << "  NONE\n";
+    } else {
+        for (const FtResizeEntry &e : fr.entries) {
+            cout << "  " << e.block_name << "," << e.pass1_ft_nets << "," << e.budget_ft_nets << "," << e.final_ft_nets
+                 << "," << fmt(e.conversion_rate) << "," << fmt(e.grow_per_side)
+                 << "," << fmt(e.old_width) << "," << fmt(e.old_height)
+                 << "," << fmt(e.new_width) << "," << fmt(e.new_height)
+                 << "," << fmt(e.area_delta)
+                 << "," << (e.aspect_ok ? "YES" : "NO")
+                 << "," << (e.outline_fit_ok ? "YES" : "NO")
+                 << "," << (e.final_ft_covered_by_budget ? "YES" : "NO") << "\n";
+        }
+    }
+
+    cout << "\nCHANNEL_CAPACITY_SUMMARY_DETAILED:\n";
+    cout << "  # Capacity model for this report: 25 * min(channel_width, channel_height).\n";
+    cout << "  # This is a conservative debug report to locate bottleneck channels; capacity is still WARN, not FAIL.\n";
+    cout << "  overloaded_channels_simple: " << overflowCount << " / " << overflowReport.size() << "\n";
+    cout << "  total_overflow_nets_simple: " << fmt(totalOverflow) << "\n";
+    if (!overflowReport.empty()) {
+        const ChannelOverflowDetail &worstOverflow = overflowReport.front();
+        auto worstUtilIt = max_element(overflowReport.begin(), overflowReport.end(), [](const ChannelOverflowDetail &a, const ChannelOverflowDetail &b) {
+            return a.utilization < b.utilization;
+        });
+        cout << "  worst_by_overflow: " << worstOverflow.name
+             << " load=" << worstOverflow.load
+             << " cap=" << fmt(worstOverflow.capacity)
+             << " overflow=" << fmt(worstOverflow.overflow)
+             << " util=" << fmt(worstOverflow.utilization) << "\n";
+        if (worstUtilIt != overflowReport.end()) {
+            cout << "  worst_by_utilization: " << worstUtilIt->name
+                 << " load=" << worstUtilIt->load
+                 << " cap=" << fmt(worstUtilIt->capacity)
+                 << " overflow=" << fmt(worstUtilIt->overflow)
+                 << " util=" << fmt(worstUtilIt->utilization) << "\n";
+        }
+    }
+
+    cout << "\nCHANNEL_OVERFLOW_REPORT_DETAILED:\n";
+    cout << "  # Sorted by overflow first, then utilization. top_contributors shows the largest net-count routes using that channel.\n";
+    cout << "  channel,lx,ly,width,height,load,capacity,overflow,utilization,path_count,top_contributors\n";
+    bool printedOverflow = false;
+    for (const ChannelOverflowDetail &r : overflowReport) {
+        if (r.overflow <= EPS) continue;
+        printedOverflow = true;
+        cout << "  " << r.name << "," << fmt(r.lx) << "," << fmt(r.ly) << ","
+             << fmt(r.width) << "," << fmt(r.height) << "," << r.load << ","
+             << fmt(r.capacity) << "," << fmt(r.overflow) << "," << fmt(r.utilization) << ","
+             << r.path_count << "," << contributorSummary(r.contributors, 6) << "\n";
+    }
+    if (!printedOverflow) cout << "  NONE\n";
+
+    cout << "\nCHANNEL_LOAD_REPORT_SORTED_ALL:\n";
+    cout << "  # Includes non-overflow channels too, sorted by overflow/utilization.\n";
+    cout << "  channel,lx,ly,width,height,load,capacity,overflow,utilization,path_count\n";
+    for (const ChannelOverflowDetail &r : overflowReport) {
+        cout << "  " << r.name << "," << fmt(r.lx) << "," << fmt(r.ly) << ","
+             << fmt(r.width) << "," << fmt(r.height) << "," << r.load << ","
+             << fmt(r.capacity) << "," << fmt(r.overflow) << "," << fmt(r.utilization) << ","
+             << r.path_count << "\n";
+    }
+
+    if (!d.warnings.empty() || !sr.warnings.empty() || !er.warnings.empty() || !pr.warnings.empty() || !cr.warnings.empty() || !rr.warnings.empty() || !cfg.warnings.empty() || !cv.warnings.empty() || !cv.capacity_warnings.empty() || !fr.warnings.empty()) {
         cout << "\nWARNINGS:\n";
         for (const string &w : d.warnings) cout << "  - " << w << "\n";
         for (const string &w : sr.warnings) cout << "  - " << w << "\n";
@@ -2438,12 +4091,13 @@ static void printStep7CfgVerification(const string &filename,
         for (const string &w : rr.warnings) cout << "  - " << w << "\n";
         for (const string &w : cfg.warnings) cout << "  - " << w << "\n";
         for (const string &w : cv.warnings) cout << "  - " << w << "\n";
+        for (const string &w : fr.warnings) cout << "  - " << w << "\n";
         size_t capWarnLimit = min<size_t>(20, cv.capacity_warnings.size());
         for (size_t wi = 0; wi < capWarnLimit; ++wi) cout << "  - " << cv.capacity_warnings[wi] << "\n";
         if (cv.capacity_warnings.size() > capWarnLimit) cout << "  - ... " << (cv.capacity_warnings.size() - capWarnLimit) << " more capacity warnings omitted from console output.\n";
     }
 
-    if (!d.errors.empty() || !sr.errors.empty() || !er.errors.empty() || !pr.errors.empty() || !cr.errors.empty() || !rr.errors.empty() || !cfg.errors.empty() || !verifyErrors.empty() || !cv.format_errors.empty() || !cv.geometry_errors.empty() || !cv.routing_errors.empty()) {
+    if (!d.errors.empty() || !sr.errors.empty() || !er.errors.empty() || !pr.errors.empty() || !cr.errors.empty() || !rr.errors.empty() || !cfg.errors.empty() || !verifyErrors.empty() || !cv.format_errors.empty() || !cv.geometry_errors.empty() || !cv.routing_errors.empty() || !fr.errors.empty()) {
         cout << "\nERRORS:\n";
         for (const string &e : d.errors) cout << "  - " << e << "\n";
         for (const string &e : sr.errors) cout << "  - " << e << "\n";
@@ -2456,15 +4110,16 @@ static void printStep7CfgVerification(const string &filename,
         for (const string &e : cv.format_errors) cout << "  - CFG_FORMAT: " << e << "\n";
         for (const string &e : cv.geometry_errors) cout << "  - CFG_GEOMETRY: " << e << "\n";
         for (const string &e : cv.routing_errors) cout << "  - CFG_ROUTING: " << e << "\n";
+        for (const string &e : fr.errors) cout << "  - FT_RESIZE: " << e << "\n";
     }
 
-    cout << "\nRESULT: " << (parserOk && shapeOk && placementOk && channelOk && routingOk && cfg.written && cfg.errors.empty() && cv.overall_pass ? (cv.capacity_ok ? "PASS" : "PASS_WITH_CAPACITY_WARNINGS") : "FAIL") << "\n";
+    cout << "\nRESULT: " << (parserOk && shapeOk && placementOk && channelOk && routingOk && cfg.written && cfg.errors.empty() && fr.errors.empty() && cv.overall_pass ? (cv.capacity_ok ? "PASS" : "PASS_WITH_CAPACITY_WARNINGS") : "FAIL") << "\n";
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <input_case.csv> [more_case.csv ...]\n";
-        cerr << "This Step-8 version parses, places blocks, generates channels, routes all nonzero connections through channels only, writes a .cfg file, then validates the generated .cfg format/geometry/routing.\n";
+        cerr << "This Step-16 version does two-pass SOFT feedthrough size recalculation, writes a .cfg file, then validates the generated .cfg format/geometry/routing.\n";
         return 1;
     }
 
@@ -2472,15 +4127,17 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         string filename = argv[i];
         InputData data = parseInputCsv(filename);
-        ShapeResult shapes = generateLegalBlockShapes(data);
-        EdgePlacementResult edgePlacement = placeEdgeBlocksFirst(data, shapes);
-        FullPlacementResult fullPlacement = placeAllBlocksAfterEdges(data, shapes, edgePlacement);
-        ChannelGenerationResult channels = generateVerticalSliceChannels(data, fullPlacement);
-        RoutingGenerationResult routing = routeAllConnectionsThroughChannelsOnly(data, fullPlacement, channels);
+        ShapeResult baseShapes = generateLegalBlockShapes(data);
+        EdgePlacementResult edgePlacement = placeEdgeBlocksFirst(data, baseShapes);
+        TwoPassFtResult twoPass = chooseTwoPassFtResizedPlacementAndRouting(data, baseShapes, edgePlacement);
+        ShapeResult finalShapes = twoPass.resized_shapes;
+        FullPlacementResult fullPlacement = twoPass.pass2.placement;
+        ChannelGenerationResult channels = twoPass.pass2.channels;
+        RoutingGenerationResult routing = twoPass.pass2.routing;
         CfgWriteResult cfg = writeCfgFile(filename, data, fullPlacement, channels, routing);
         CfgValidationResult cfgValidation = validateGeneratedCfgFile(cfg.output_path, data);
-        printStep7CfgVerification(filename, data, shapes, edgePlacement, fullPlacement, channels, routing, cfg, cfgValidation);
-        if (!data.errors.empty() || !shapes.errors.empty() || !edgePlacement.errors.empty() || !fullPlacement.errors.empty() || !channels.errors.empty() || !routing.errors.empty() || !cfg.errors.empty() || !cfg.written || !cfgValidation.overall_pass) anyFail = true;
+        printStep16CfgVerification(filename, data, finalShapes, edgePlacement, fullPlacement, channels, routing, cfg, cfgValidation, twoPass.resize);
+        if (!data.errors.empty() || !finalShapes.errors.empty() || !edgePlacement.errors.empty() || !fullPlacement.errors.empty() || !channels.errors.empty() || !routing.errors.empty() || !cfg.errors.empty() || !cfg.written || !twoPass.resize.errors.empty() || !cfgValidation.overall_pass) anyFail = true;
     }
     return anyFail ? 2 : 0;
 }
