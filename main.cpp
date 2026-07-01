@@ -9,6 +9,7 @@
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,9 @@
 using namespace std;
 
 static constexpr double EPS = 1e-6;
+// Step-22: multi-candidate placement search. When false, bottleneck-relief placement
+// candidates are not added, giving the Step-19/Step-18 style safe baseline.
+static bool g_enable_bottleneck_placement = true;
 static constexpr double AREA_REL_TOL = 1e-5;
 
 static string trim(const string &s) {
@@ -932,6 +936,12 @@ struct PlacementStrategyConfig {
     double connectivity_weight = 1.0;
     double center_weight = 0.0;
     double compact_weight = 1.0;
+
+    // Step-20: optional bottleneck guide. Values are normalized to [0,1];
+    // blocks that dominated overflow channels get extra clearance.
+    vector<double> bottleneck_pressure;
+    double bottleneck_gap_scale = 0.0;
+    double bottleneck_center_weight = 0.0;
 };
 
 static double totalBlockDemand(const InputData &d, int idx) {
@@ -1024,7 +1034,12 @@ static FullPlacementResult placeAllBlocksAfterEdgesWithStrategy(const InputData 
         const Block &b = d.blocks[idx];
         const BlockShape &s = sr.shapes[idx];
         double normDemand = (maxDemand > EPS ? demand[idx] / maxDemand : 0.0);
-        double dynamicGap = cfg.base_gap + cfg.extra_gap * sqrt(max(0.0, normDemand));
+        double bottleneckPressure = 0.0;
+        if (idx >= 0 && idx < static_cast<int>(cfg.bottleneck_pressure.size())) {
+            bottleneckPressure = max(0.0, min(1.0, cfg.bottleneck_pressure[idx]));
+        }
+        double dynamicGap = cfg.base_gap + cfg.extra_gap * sqrt(max(0.0, normDemand))
+                            + cfg.bottleneck_gap_scale * sqrt(max(0.0, bottleneckPressure));
 
         vector<double> gapTrials;
         gapTrials.push_back(dynamicGap);
@@ -1071,8 +1086,8 @@ static FullPlacementResult placeAllBlocksAfterEdgesWithStrategy(const InputData 
                 scoreA += cfg.connectivity_weight * candidateConnectivityScore(d, idx, a, placedByIndex);
                 scoreB += cfg.connectivity_weight * candidateConnectivityScore(d, idx, bRect, placedByIndex);
             }
-            scoreA += cfg.center_weight * normDemand * candidateCenterBiasScore(a, d.outline_width, d.outline_height);
-            scoreB += cfg.center_weight * normDemand * candidateCenterBiasScore(bRect, d.outline_width, d.outline_height);
+            scoreA += (cfg.center_weight * normDemand + cfg.bottleneck_center_weight * bottleneckPressure) * candidateCenterBiasScore(a, d.outline_width, d.outline_height);
+            scoreB += (cfg.center_weight * normDemand + cfg.bottleneck_center_weight * bottleneckPressure) * candidateCenterBiasScore(bRect, d.outline_width, d.outline_height);
             scoreA += cfg.compact_weight * (1.0 - 0.55 * normDemand) * candidateCompactScore(a);
             scoreB += cfg.compact_weight * (1.0 - 0.55 * normDemand) * candidateCompactScore(bRect);
             if (fabs(scoreA - scoreB) > 1e-4) return scoreA < scoreB;
@@ -1589,6 +1604,19 @@ static double loadPenaltyForEnteringChannel(const ChannelGenerationResult &cr,
 }
 
 
+
+static bool channelHasEnoughRemainingCapacity(const ChannelGenerationResult &cr,
+                                              const vector<long long> &currentLoads,
+                                              int channelNode,
+                                              int blockCount,
+                                              int nets) {
+    int chIdx = channelNode - blockCount;
+    if (chIdx < 0 || chIdx >= static_cast<int>(cr.channels.size())) return true;
+    double cap = simpleChannelCapacity(cr.channels[chIdx]);
+    double before = (chIdx < static_cast<int>(currentLoads.size())) ? static_cast<double>(currentLoads[chIdx]) : 0.0;
+    return before + static_cast<double>(nets) <= cap + 1e-6;
+}
+
 static double softFeedthroughCapacityEstimate(const InputData &d,
                                               const FullPlacementResult &pr,
                                               int blockIdx) {
@@ -1750,6 +1778,113 @@ static bool dijkstraLoadAwareRouteOneWithSoftFeedthrough(const InputData &d,
     reverse(rev.begin(), rev.end());
     outNodes = rev;
     return true;
+}
+
+
+static bool dijkstraCapacityConstrainedRouteOneWithSoftFeedthrough(const InputData &d,
+                                                                   const FullPlacementResult &pr,
+                                                                   const ChannelGenerationResult &cr,
+                                                                   const vector<vector<RoutingAdjEdge>> &graph,
+                                                                   const vector<long long> &currentChannelLoads,
+                                                                   const vector<long long> &currentFtLoads,
+                                                                   int source,
+                                                                   int target,
+                                                                   int nets,
+                                                                   bool respectPortEdges,
+                                                                   vector<int> &outNodes,
+                                                                   string &failReason) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    int nNodes = nBlocks + static_cast<int>(cr.channels.size());
+    const double INF = 1e100;
+    vector<double> dist(nNodes, INF);
+    vector<int> parent(nNodes, -1);
+    using State = pair<double, int>;
+    priority_queue<State, vector<State>, greater<State>> pq;
+    dist[source] = 0.0;
+    pq.push({0.0, source});
+
+    while (!pq.empty()) {
+        State cur = pq.top();
+        double du = cur.first;
+        int u = cur.second;
+        pq.pop();
+        if (du > dist[u] + EPS) continue;
+        if (u == target) break;
+
+        for (const RoutingAdjEdge &e : graph[u]) {
+            int v = e.to;
+            bool vIsBlock = !isChannelNode(v, nBlocks);
+            if (vIsBlock && v != target && !isIntermediateSoftBlockAllowed(d, v, source, target)) continue;
+
+            if (respectPortEdges) {
+                if (u == source && !edgeAllowedByPortConstraint(d.blocks[source], e.edge_from)) continue;
+                if (v == target && !edgeAllowedByPortConstraint(d.blocks[target], e.edge_to)) continue;
+            }
+
+            // Hard capacity rule: a new route job may not enter a channel if doing so
+            // would exceed the conservative 25 nets/um capacity model used by the checker.
+            if (isChannelNode(v, nBlocks) &&
+                !channelHasEnoughRemainingCapacity(cr, currentChannelLoads, v, nBlocks, nets)) {
+                continue;
+            }
+
+            double stepCost = 1.0;
+            if (isChannelNode(v, nBlocks)) {
+                // Even under the hard rule, prefer lower-utilization channels.
+                stepCost += loadPenaltyForEnteringChannel(cr, currentChannelLoads, v, nBlocks, nets);
+            } else if (isIntermediateSoftBlockAllowed(d, v, source, target)) {
+                stepCost += softFeedthroughPenaltyForEnteringBlock(d, pr, currentFtLoads, v, nets);
+            }
+            stepCost += 1e-6 * static_cast<double>(v + 1);
+
+            if (dist[u] + stepCost + EPS < dist[v]) {
+                dist[v] = dist[u] + stepCost;
+                parent[v] = u;
+                pq.push({dist[v], v});
+            }
+        }
+    }
+
+    if (dist[target] >= INF / 2.0) {
+        failReason = respectPortEdges ? "no capacity-constrained soft-feedthrough path with current PORT EDGE constraints" : "no capacity-constrained soft-feedthrough path even after relaxing PORT EDGE constraints";
+        return false;
+    }
+
+    vector<int> rev;
+    for (int cur = target; cur != -1; cur = parent[cur]) rev.push_back(cur);
+    reverse(rev.begin(), rev.end());
+    outNodes = rev;
+    return true;
+}
+
+static bool makeSelfRouteViaLeastLoadedAdjacentChannelCapacityConstrained(const InputData &d,
+                                                                          const ChannelGenerationResult &cr,
+                                                                          const vector<vector<RoutingAdjEdge>> &graph,
+                                                                          const vector<long long> &currentLoads,
+                                                                          int block,
+                                                                          int nets,
+                                                                          bool respectPortEdges,
+                                                                          vector<int> &outNodes,
+                                                                          string &failReason) {
+    int nBlocks = static_cast<int>(d.blocks.size());
+    double bestCost = 1e100;
+    int bestChannel = -1;
+    for (const RoutingAdjEdge &e : graph[block]) {
+        if (!isChannelNode(e.to, nBlocks)) continue;
+        if (respectPortEdges && !edgeAllowedByPortConstraint(d.blocks[block], e.edge_from)) continue;
+        if (!channelHasEnoughRemainingCapacity(cr, currentLoads, e.to, nBlocks, nets)) continue;
+        double cost = loadPenaltyForEnteringChannel(cr, currentLoads, e.to, nBlocks, nets) + 1e-6 * static_cast<double>(e.to + 1);
+        if (cost + EPS < bestCost) {
+            bestCost = cost;
+            bestChannel = e.to;
+        }
+    }
+    if (bestChannel >= 0) {
+        outNodes = {block, bestChannel, block};
+        return true;
+    }
+    failReason = respectPortEdges ? "self-connection has no adjacent channel with remaining capacity on allowed PORT EDGE" : "self-connection has no adjacent channel with remaining capacity";
+    return false;
 }
 
 static bool makeSelfRouteViaOneAdjacentChannel(const InputData &d,
@@ -2475,6 +2610,143 @@ static RoutingGenerationResult ripUpAndRerouteOverflowChannelsWithSoftFeedthroug
     return best;
 }
 
+
+static bool buildOneCapacityConstrainedSoftFeedthroughRoutePattern(const InputData &d,
+                                                                    const FullPlacementResult &pr,
+                                                                    const ChannelGenerationResult &cr,
+                                                                    const vector<vector<RoutingAdjEdge>> &graph,
+                                                                    const vector<long long> &currentChannelLoads,
+                                                                    const vector<long long> &currentFtLoads,
+                                                                    int from,
+                                                                    int to,
+                                                                    int nets,
+                                                                    RoutePattern &rp) {
+    rp = RoutePattern();
+    rp.from = from;
+    rp.to = to;
+    rp.nets = nets;
+    vector<int> nodes;
+    string reason;
+    bool ok = false;
+
+    if (from == to) {
+        ok = makeSelfRouteViaLeastLoadedAdjacentChannelCapacityConstrained(d, cr, graph, currentChannelLoads, from, nets, true, nodes, reason);
+    } else {
+        ok = dijkstraCapacityConstrainedRouteOneWithSoftFeedthrough(d, pr, cr, graph, currentChannelLoads, currentFtLoads, from, to, nets, true, nodes, reason);
+    }
+
+    if (!ok) {
+        string strictReason = reason;
+        if (from == to) {
+            ok = makeSelfRouteViaLeastLoadedAdjacentChannelCapacityConstrained(d, cr, graph, currentChannelLoads, from, nets, false, nodes, reason);
+        } else {
+            ok = dijkstraCapacityConstrainedRouteOneWithSoftFeedthrough(d, pr, cr, graph, currentChannelLoads, currentFtLoads, from, to, nets, false, nodes, reason);
+        }
+        if (ok) {
+            rp.used_port_relaxation = true;
+            rp.fail_reason = "strict capacity-constrained route was unavailable: " + strictReason;
+        }
+    }
+
+    if (!ok) {
+        rp.routed = false;
+        rp.fail_reason = reason;
+        return false;
+    }
+    rp.routed = true;
+    rp.nodes = nodes;
+    rp.estimated_wirelength = estimateRouteWirelengthAndSteps(d, cr, graph, nodes, nets, rp.steps);
+    return true;
+}
+
+static RoutingGenerationResult routeConnectionJobsCapacityConstrainedWithSoftFeedthrough(const InputData &d,
+                                                                                         const FullPlacementResult &pr,
+                                                                                         const ChannelGenerationResult &cr,
+                                                                                         const vector<Connection> &jobs,
+                                                                                         const string &modeLabel) {
+    RoutingGenerationResult rr;
+    rr.channel_loads.assign(cr.channels.size(), 0);
+    rr.soft_ft_loads.assign(d.blocks.size(), 0);
+    vector<vector<RoutingAdjEdge>> graph = buildRoutingGraph(d, pr, cr);
+
+    vector<int> order(jobs.size());
+    iota(order.begin(), order.end(), 0);
+    // For hard-capacity routing, smaller jobs are easier to pack through leftover channel
+    // capacity. Sort by source/destination too for deterministic output.
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        const Connection &ca = jobs[a];
+        const Connection &cb = jobs[b];
+        if (ca.nets != cb.nets) return ca.nets < cb.nets;
+        string aa = d.blocks[ca.from].name + "->" + d.blocks[ca.to].name;
+        string bb = d.blocks[cb.from].name + "->" + d.blocks[cb.to].name;
+        if (aa != bb) return aa < bb;
+        return a < b;
+    });
+
+    int nBlocks = static_cast<int>(d.blocks.size());
+    for (int jobIndex : order) {
+        const Connection &conn = jobs[jobIndex];
+        RoutePattern rp;
+        bool ok = buildOneCapacityConstrainedSoftFeedthroughRoutePattern(d, pr, cr, graph, rr.channel_loads, rr.soft_ft_loads, conn.from, conn.to, conn.nets, rp);
+        if (!ok) {
+            rr.unrouted_count++;
+            rr.unrouted_nets += conn.nets;
+            rr.errors.push_back("Unrouted capacity-constrained route job " + d.blocks[conn.from].name + " -> " + d.blocks[conn.to].name +
+                                " nets=" + to_string(conn.nets) + ": " + rp.fail_reason);
+        } else {
+            rr.routed_count++;
+            rr.routed_nets += conn.nets;
+            if (rp.used_port_relaxation) rr.port_relaxed_count++;
+            rr.total_estimated_wirelength += rp.estimated_wirelength;
+            for (int node : rp.nodes) {
+                if (isChannelNode(node, nBlocks)) {
+                    int chIdx = node - nBlocks;
+                    if (chIdx >= 0 && chIdx < static_cast<int>(rr.channel_loads.size())) rr.channel_loads[chIdx] += conn.nets;
+                }
+            }
+            for (size_t ni = 1; ni + 1 < rp.nodes.size(); ++ni) {
+                int node = rp.nodes[ni];
+                if (!isChannelNode(node, nBlocks) && node >= 0 && node < nBlocks && d.blocks[node].type == "SOFT") {
+                    if (node < static_cast<int>(rr.soft_ft_loads.size())) rr.soft_ft_loads[node] += conn.nets;
+                }
+            }
+        }
+        rr.routes.push_back(rp);
+    }
+
+    long long totalFt = 0;
+    int softUsed = 0;
+    for (long long v : rr.soft_ft_loads) { totalFt += v; if (v > 0) softUsed++; }
+    RoutingQualitySummary q = summarizeRoutingQuality(cr, rr);
+    rr.warnings.insert(rr.warnings.begin(),
+        modeLabel + ": " + splitJobSummary(d, jobs) +
+        " hard_channel_capacity=true" +
+        " soft_ft_blocks_used=" + to_string(softUsed) +
+        " soft_ft_total_nets=" + to_string(totalFt) +
+        " quality{" + routingQualityToString(q) + "}");
+    return rr;
+}
+
+static RoutingGenerationResult routeAllConnectionsCapacityConstrainedSoftFeedthroughNoSplit(const InputData &d,
+                                                                                            const FullPlacementResult &pr,
+                                                                                            const ChannelGenerationResult &cr) {
+    return routeConnectionJobsCapacityConstrainedWithSoftFeedthrough(d, pr, cr, d.connections, "CAPACITY_CONSTRAINED_SOFT_FT_NO_SPLIT");
+}
+
+static RoutingGenerationResult routeAllConnectionsSplitCapacityConstrainedSoftFeedthrough(const InputData &d,
+                                                                                          const FullPlacementResult &pr,
+                                                                                          const ChannelGenerationResult &cr,
+                                                                                          int targetChunk,
+                                                                                          int minSplitNets,
+                                                                                          int maxPartsPerConnection) {
+    vector<Connection> jobs = splitConnectionsByTargetChunk(d, targetChunk, minSplitNets, maxPartsPerConnection);
+    return routeConnectionJobsCapacityConstrainedWithSoftFeedthrough(
+        d, pr, cr, jobs,
+        "SPLIT_CAPACITY_CONSTRAINED_SOFT_FT target_chunk=" + to_string(targetChunk) +
+        " min_split_nets=" + to_string(minSplitNets) +
+        " max_parts=" + to_string(maxPartsPerConnection));
+}
+
 static RoutingGenerationResult routeAllConnectionsHybridLoadAwareChannelOnly(const InputData &d,
                                                                              const FullPlacementResult &pr,
                                                                              const ChannelGenerationResult &cr) {
@@ -2495,6 +2767,9 @@ static RoutingGenerationResult routeAllConnectionsHybridLoadAwareChannelOnly(con
     RoutingGenerationResult softFtReroute = ripUpAndRerouteOverflowChannelsWithSoftFeedthrough(d, pr, cr, softFt);
     candidates.push_back({"SOFT_FEEDTHROUGH_RIPUP_NO_SPLIT", softFtReroute});
 
+    RoutingGenerationResult capSoftFt = routeAllConnectionsCapacityConstrainedSoftFeedthroughNoSplit(d, pr, cr);
+    candidates.push_back({"CAPACITY_CONSTRAINED_SOFT_FT_NO_SPLIT", capSoftFt});
+
     // Try several split granularities. Smaller chunks give the router more freedom to distribute
     // traffic, but too many chunks can increase wirelength and output size. The selector below keeps
     // only the best result for the current placement.
@@ -2504,7 +2779,12 @@ static RoutingGenerationResult routeAllConnectionsHybridLoadAwareChannelOnly(con
         {1500, 1800, 10},
         {1000, 1200, 12},
         {750, 1000, 14},
-        {500, 800, 16}
+        {500, 800, 16},
+        {350, 600, 24},
+        {250, 400, 32},
+        {150, 200, 80},
+        {100, 120, 120},
+        {50, 60, 240}
     };
 
     for (const SplitCfg &sc : splitCfgs) {
@@ -2519,6 +2799,9 @@ static RoutingGenerationResult routeAllConnectionsHybridLoadAwareChannelOnly(con
 
         RoutingGenerationResult splitSoftReroute = ripUpAndRerouteOverflowChannelsWithSoftFeedthrough(d, pr, cr, splitSoft);
         candidates.push_back({"SPLIT_SOFT_FEEDTHROUGH_RIPUP_CHUNK_" + to_string(sc.chunk), splitSoftReroute});
+
+        RoutingGenerationResult splitCapSoft = routeAllConnectionsSplitCapacityConstrainedSoftFeedthrough(d, pr, cr, sc.chunk, sc.minSplit, sc.maxParts);
+        candidates.push_back({"SPLIT_CAPACITY_CONSTRAINED_SOFT_FT_CHUNK_" + to_string(sc.chunk), splitCapSoft});
     }
 
     int best = 0;
@@ -3616,6 +3899,88 @@ static vector<PlacementStrategyConfig> demandAwarePlacementStrategies() {
     spacious.center_weight = 0.45;
     spacious.compact_weight = 0.65;
     cfgs.push_back(spacious);
+
+    // Step-22: extra compact multi-candidate starts. They reuse the same legal
+    // placement engine but explore different spacing/scoring tradeoffs.
+    PlacementStrategyConfig relaxed;
+    relaxed.name = "MULTI_CANDIDATE_CENTER_RELAXED";
+    relaxed.demand_aware = true;
+    relaxed.base_gap = 28.0;
+    relaxed.extra_gap = 115.0;
+    relaxed.connectivity_weight = 0.70;
+    relaxed.center_weight = 0.55;
+    relaxed.compact_weight = 0.50;
+    cfgs.push_back(relaxed);
+
+    PlacementStrategyConfig highway;
+    highway.name = "MULTI_CANDIDATE_WIDER_HIGHWAYS";
+    highway.demand_aware = true;
+    highway.base_gap = 40.0;
+    highway.extra_gap = 175.0;
+    highway.connectivity_weight = 0.55;
+    highway.center_weight = 0.60;
+    highway.compact_weight = 0.32;
+    cfgs.push_back(highway);
+
+    return cfgs;
+}
+
+static vector<double> computeBottleneckBlockPressureFromAttempt(const InputData &d,
+                                                                 const ChannelGenerationResult &channels,
+                                                                 const RoutingGenerationResult &routing) {
+    vector<double> pressure(d.blocks.size(), 0.0);
+    vector<ChannelOverflowDetail> report = buildDetailedChannelOverflowReport(d, channels, routing);
+    unordered_map<string, int> blockIndex;
+    for (int i = 0; i < static_cast<int>(d.blocks.size()); ++i) blockIndex[d.blocks[i].name] = i;
+
+    for (const ChannelOverflowDetail &r : report) {
+        if (r.overflow <= EPS) continue;
+        double channelSeverity = max(1.0, r.overflow / max(1.0, r.capacity));
+        int taken = 0;
+        for (const ChannelRouteContributor &c : r.contributors) {
+            if (taken >= 8) break;
+            double w = static_cast<double>(c.nets) * channelSeverity;
+            auto itA = blockIndex.find(c.from_name);
+            auto itB = blockIndex.find(c.to_name);
+            if (itA != blockIndex.end()) pressure[itA->second] += w;
+            if (itB != blockIndex.end()) pressure[itB->second] += w;
+            taken++;
+        }
+    }
+    double maxP = 0.0;
+    for (double v : pressure) maxP = max(maxP, v);
+    if (maxP > EPS) for (double &v : pressure) v = min(1.0, v / maxP);
+    return pressure;
+}
+
+static string summarizeBottleneckPressure(const InputData &d, const vector<double> &pressure) {
+    vector<pair<double,string>> v;
+    for (size_t i = 0; i < d.blocks.size() && i < pressure.size(); ++i) if (pressure[i] > 1e-6) v.push_back({pressure[i], d.blocks[i].name});
+    sort(v.begin(), v.end(), [](const pair<double,string> &a, const pair<double,string> &b) {
+        if (fabs(a.first - b.first) > 1e-9) return a.first > b.first;
+        return a.second < b.second;
+    });
+    if (v.empty()) return "NONE";
+    stringstream ss; int limit = min<int>(10, v.size());
+    for (int i = 0; i < limit; ++i) { if (i) ss << ";"; ss << v[i].second << "=" << fmt(v[i].first); }
+    if (static_cast<int>(v.size()) > limit) ss << ";..." << (v.size() - limit) << " more";
+    return ss.str();
+}
+
+static vector<PlacementStrategyConfig> bottleneckAwarePlacementStrategies(const vector<double> &pressure) {
+    vector<PlacementStrategyConfig> cfgs;
+    PlacementStrategyConfig m;
+    m.name = "BOTTLENECK_RELIEF_MEDIUM"; m.demand_aware = true; m.base_gap = 24.0; m.extra_gap = 80.0;
+    m.connectivity_weight = 0.80; m.center_weight = 0.35; m.compact_weight = 0.70;
+    m.bottleneck_pressure = pressure; m.bottleneck_gap_scale = 80.0; m.bottleneck_center_weight = 0.45; cfgs.push_back(m);
+    PlacementStrategyConfig s = m;
+    s.name = "BOTTLENECK_RELIEF_STRONG"; s.base_gap = 32.0; s.extra_gap = 130.0;
+    s.connectivity_weight = 0.65; s.center_weight = 0.45; s.compact_weight = 0.55;
+    s.bottleneck_gap_scale = 140.0; s.bottleneck_center_weight = 0.65; cfgs.push_back(s);
+    PlacementStrategyConfig w = m;
+    w.name = "BOTTLENECK_RELIEF_WIDE_CHANNELS"; w.base_gap = 44.0; w.extra_gap = 190.0;
+    w.connectivity_weight = 0.55; w.center_weight = 0.55; w.compact_weight = 0.35;
+    w.bottleneck_gap_scale = 220.0; w.bottleneck_center_weight = 0.85; cfgs.push_back(w);
     return cfgs;
 }
 
@@ -3645,13 +4010,32 @@ static PlacementRoutingAttempt chooseDemandAwarePlacementAndRouting(const InputD
                                                                     const EdgePlacementResult &edgePlacement) {
     vector<PlacementRoutingAttempt> attempts;
     for (const PlacementStrategyConfig &cfg : demandAwarePlacementStrategies()) {
+        // Keep the largest case fast and stable; it already has many routing candidates.
+        if (d.blocks.size() > 20 && cfg.name.rfind("MULTI_CANDIDATE", 0) == 0) continue;
         attempts.push_back(makePlacementRoutingAttempt(d, shapes, edgePlacement, cfg));
     }
+
+    int bestSeed = 0;
+    for (int i = 1; i < static_cast<int>(attempts.size()); ++i) {
+        if (betterPlacementRoutingAttempt(attempts[i], attempts[bestSeed])) bestSeed = i;
+    }
+
+    vector<double> bottleneckPressure;
+    if (g_enable_bottleneck_placement && attempts[bestSeed].valid_for_selection && attempts[bestSeed].overflow_amount > EPS) {
+        bottleneckPressure = computeBottleneckBlockPressureFromAttempt(d, attempts[bestSeed].channels, attempts[bestSeed].routing);
+        for (PlacementStrategyConfig cfg : bottleneckAwarePlacementStrategies(bottleneckPressure)) {
+            attempts.push_back(makePlacementRoutingAttempt(d, shapes, edgePlacement, cfg));
+        }
+    }
+
     int best = 0;
     for (int i = 1; i < static_cast<int>(attempts.size()); ++i) {
         if (betterPlacementRoutingAttempt(attempts[i], attempts[best])) best = i;
     }
     PlacementRoutingAttempt chosen = attempts[best];
+    if (!bottleneckPressure.empty()) {
+        chosen.placement.warnings.push_back("BOTTLENECK_PLACEMENT_PRESSURE_TOP: " + summarizeBottleneckPressure(d, bottleneckPressure));
+    }
 
     stringstream ss;
     ss << "PLACEMENT_ROUTING_SELECTED: " << chosen.name
@@ -3710,6 +4094,15 @@ struct TwoPassFtResult {
     PlacementRoutingAttempt pass1;
     PlacementRoutingAttempt pass2;
     FtResizeResult resize;
+};
+
+struct FixedPointFtResult {
+    ShapeResult resized_shapes;
+    PlacementRoutingAttempt initial;
+    vector<PlacementRoutingAttempt> loop_attempts;
+    vector<FtResizeResult> loop_resizes;
+    PlacementRoutingAttempt final_attempt;
+    FtResizeResult final_resize;
 };
 
 static int ftConversionBucketIndex(long long nets) {
@@ -3832,7 +4225,7 @@ static void updateFtResizeResultWithFinalLoads(const InputData &d,
     }
 }
 
-static TwoPassFtResult chooseTwoPassFtResizedPlacementAndRouting(const InputData &d,
+[[maybe_unused]] static TwoPassFtResult chooseTwoPassFtResizedPlacementAndRouting(const InputData &d,
                                                                  const ShapeResult &baseShapes,
                                                                  const EdgePlacementResult &edgePlacement) {
     TwoPassFtResult t;
@@ -3857,7 +4250,315 @@ static TwoPassFtResult chooseTwoPassFtResizedPlacementAndRouting(const InputData
     return t;
 }
 
-static void printStep16CfgVerification(const string &filename,
+static FixedPointFtResult chooseFixedPointFtResizeLoop(const InputData &d,
+                                                       const ShapeResult &baseShapes,
+                                                       const EdgePlacementResult &edgePlacement,
+                                                       int resizeLoopCount) {
+    FixedPointFtResult fp;
+    resizeLoopCount = max(1, resizeLoopCount);
+
+    fp.initial = chooseDemandAwarePlacementAndRouting(d, baseShapes, edgePlacement);
+    PlacementRoutingAttempt currentAttempt = fp.initial;
+    PlacementRoutingAttempt lastValidAttempt = fp.initial;
+    FtResizeResult lastValidResize;
+    bool hasValidResizedLoop = false;
+    vector<string> loopSummaryWarnings;
+
+    for (int iter = 1; iter <= resizeLoopCount; ++iter) {
+        FtResizeResult fr = applyTwoPassFtResizeFromPass1Loads(d, baseShapes, currentAttempt.routing.soft_ft_loads);
+        ShapeResult iterShapes = fr.resized_shapes;
+        PlacementRoutingAttempt nextAttempt = chooseDemandAwarePlacementAndRouting(d, iterShapes, edgePlacement);
+        updateFtResizeResultWithFinalLoads(d, nextAttempt.routing.soft_ft_loads, fr);
+
+        bool accepted = nextAttempt.valid_for_selection && nextAttempt.routing.unrouted_count == 0 &&
+                        nextAttempt.placement.errors.empty() && nextAttempt.channels.errors.empty() &&
+                        nextAttempt.routing.errors.empty() && fr.errors.empty();
+
+        string iterSummary = "FIXED_POINT_FT_RESIZE_ITER_" + to_string(iter) +
+            (accepted ? "_ACCEPTED" : "_REJECTED_KEEP_PREVIOUS_VALID") +
+            ": input_ft_nets=" + to_string(fr.pass1_total_ft_nets) +
+            " budget_ft_nets=" + to_string(fr.budget_total_ft_nets) +
+            " final_ft_nets=" + to_string(fr.final_total_ft_nets) +
+            " added_soft_area=" + fmt(fr.total_area_delta) +
+            " overflow=" + fmt(nextAttempt.overflow_amount) +
+            " unrouted=" + to_string(nextAttempt.routing.unrouted_count) +
+            " wl=" + fmt(nextAttempt.routing.total_estimated_wirelength);
+        loopSummaryWarnings.push_back(iterSummary);
+
+        nextAttempt.placement.warnings.push_back(iterSummary);
+        for (const string &w : fr.warnings) nextAttempt.placement.warnings.push_back(w);
+        if (accepted) {
+            for (const string &e : fr.errors) nextAttempt.placement.errors.push_back(e);
+        }
+
+        fp.loop_resizes.push_back(fr);
+        fp.loop_attempts.push_back(nextAttempt);
+
+        if (accepted) {
+            currentAttempt = nextAttempt;
+            lastValidAttempt = nextAttempt;
+            lastValidResize = fr;
+            hasValidResizedLoop = true;
+        } else {
+            // Still did this fixed-point trial, but do not let an over-sized/unplaceable trial
+            // replace the last valid output. This keeps the generated cfg legal.
+            break;
+        }
+    }
+
+    fp.final_attempt = hasValidResizedLoop ? lastValidAttempt : fp.initial;
+    fp.final_resize = hasValidResizedLoop ? lastValidResize : FtResizeResult{};
+    fp.resized_shapes = hasValidResizedLoop ? fp.final_resize.resized_shapes : baseShapes;
+
+    fp.final_attempt.placement.warnings.push_back("FIXED_POINT_FT_RESIZE_INITIAL_SELECTED: " + fp.initial.name +
+        " ft_nets=" + to_string(accumulate(fp.initial.routing.soft_ft_loads.begin(), fp.initial.routing.soft_ft_loads.end(), 0LL)) +
+        " overflow=" + fmt(fp.initial.overflow_amount) +
+        " wl=" + fmt(fp.initial.routing.total_estimated_wirelength));
+    for (const string &w : loopSummaryWarnings) fp.final_attempt.placement.warnings.push_back(w);
+    fp.final_attempt.placement.warnings.push_back("FIXED_POINT_FT_RESIZE_FINAL_AFTER_UP_TO_" + to_string(resizeLoopCount) + "_LOOPS: " + fp.final_attempt.name +
+        " final_ft_nets=" + to_string(fp.final_resize.final_total_ft_nets) +
+        " budget_ft_nets=" + to_string(fp.final_resize.budget_total_ft_nets) +
+        " added_soft_area=" + fmt(fp.final_resize.total_area_delta) +
+        " overflow=" + fmt(fp.final_attempt.overflow_amount) +
+        " wl=" + fmt(fp.final_attempt.routing.total_estimated_wirelength));
+    if (!hasValidResizedLoop) {
+        fp.final_attempt.placement.warnings.push_back("FIXED_POINT_FT_RESIZE_FALLBACK: no valid resized placement was found; using original-size placement/routing.");
+    }
+    return fp;
+}
+
+
+struct SoftAspectStrategyConfig {
+    string name;
+    int mode = 0; // 0=fixed target ratio, 1=demand-based edge direction
+    double target_ratio = 1.0;
+};
+
+struct SoftAspectReshapeChoice {
+    string selected_mode;
+    vector<string> attempt_summaries;
+    ShapeResult base_shapes;
+    EdgePlacementResult edge_placement;
+    FixedPointFtResult fixed_point;
+    bool valid = false;
+};
+
+static vector<SoftAspectStrategyConfig> softAspectReshapeStrategies() {
+    vector<SoftAspectStrategyConfig> v;
+    v.push_back({"SOFT_SHAPE_NEAR_SQUARE", 0, 1.0});
+    v.push_back({"SOFT_SHAPE_WIDE", 0, 1.75});
+    v.push_back({"SOFT_SHAPE_TALL", 0, 1.0 / 1.75});
+    v.push_back({"SOFT_SHAPE_DEMAND_BASED_EDGE_DIRECTION", 1, 1.0});
+    return v;
+}
+
+static double clampSoftAspectForBlock(const Block &b, double ratio) {
+    if (!b.has_ar) return max(EPS, ratio);
+    return min(max(ratio, b.ar_min), b.ar_max);
+}
+
+static double demandBasedSoftAspectRatio(const InputData &d, int softIdx) {
+    double horizontalDemand = 0.0;
+    double verticalDemand = 0.0;
+    double neutralDemand = 0.0;
+
+    for (const Connection &c : d.connections) {
+        int other = -1;
+        int nets = c.nets;
+        if (c.from == softIdx) other = c.to;
+        else if (c.to == softIdx) other = c.from;
+        else continue;
+
+        if (other >= 0 && other < static_cast<int>(d.blocks.size()) && d.blocks[other].type == "EDGE") {
+            bool counted = false;
+            for (const string &loc : d.blocks[other].locations) {
+                LocInfo li = decodeLocation(loc, d.outline_width, d.outline_height);
+                if (!li.valid) continue;
+                counted = true;
+                if (li.side == 'L' || li.side == 'R') horizontalDemand += nets;
+                else if (li.side == 'T' || li.side == 'B') verticalDemand += nets;
+            }
+            if (!counted) neutralDemand += nets;
+        } else {
+            neutralDemand += nets;
+        }
+    }
+
+    // If the block talks mostly to left/right edge blocks, a wider shape tends to open
+    // more top/bottom channel options around that soft block in our vertical-slice model.
+    // If it talks mostly to top/bottom edge blocks, a taller shape is tried.
+    double ratio = 1.0;
+    if (horizontalDemand > verticalDemand * 1.20 && horizontalDemand > neutralDemand * 0.25) ratio = 1.75;
+    else if (verticalDemand > horizontalDemand * 1.20 && verticalDemand > neutralDemand * 0.25) ratio = 1.0 / 1.75;
+    else ratio = 1.0;
+
+    return clampSoftAspectForBlock(d.blocks[softIdx], ratio);
+}
+
+static ShapeResult generateLegalBlockShapesWithSoftAspectStrategy(const InputData &d,
+                                                                  const SoftAspectStrategyConfig &cfg) {
+    ShapeResult sr = generateLegalBlockShapes(d);
+    sr.warnings.push_back("SOFT_ASPECT_RESHAPE_MODE: " + cfg.name);
+
+    for (size_t i = 0; i < d.blocks.size(); ++i) {
+        const Block &b = d.blocks[i];
+        if (b.type != "SOFT") continue;
+
+        double targetAspect = 1.0;
+        if (cfg.mode == 1) targetAspect = demandBasedSoftAspectRatio(d, static_cast<int>(i));
+        else targetAspect = clampSoftAspectForBlock(b, cfg.target_ratio);
+
+        BlockShape s;
+        s.width = sqrt(b.area * targetAspect);
+        s.height = sqrt(b.area / targetAspect);
+        s.area = s.width * s.height;
+        s.aspect = (s.height > 0.0 ? s.width / s.height : 0.0);
+        s.fixed_dim_ok = true;
+        s.area_ok = nearlyEqualRel(s.area, b.area);
+        s.aspect_ok = b.has_ar && s.aspect + EPS >= b.ar_min && s.aspect <= b.ar_max + EPS;
+        s.single_outline_fit_ok = (s.width <= d.outline_width + EPS && s.height <= d.outline_height + EPS);
+        sr.shapes[i] = s;
+
+        if (!s.area_ok) sr.errors.push_back(b.name + " reshaped SOFT area check failed: generated=" + fmt(s.area) + " input=" + fmt(b.area));
+        if (!s.aspect_ok) sr.errors.push_back(b.name + " reshaped SOFT aspect ratio check failed: aspect=" + fmt(s.aspect));
+        if (!s.single_outline_fit_ok) sr.errors.push_back(b.name + " reshaped SOFT cannot fit inside outline individually: " + fmt(s.width) + "x" + fmt(s.height));
+    }
+
+    return sr;
+}
+
+static string summarizeSoftAspectShapes(const InputData &d, const ShapeResult &sr) {
+    stringstream ss;
+    bool first = true;
+    for (size_t i = 0; i < d.blocks.size() && i < sr.shapes.size(); ++i) {
+        if (d.blocks[i].type != "SOFT") continue;
+        if (!first) ss << ";";
+        first = false;
+        ss << d.blocks[i].name << "(ar=" << fmt(sr.shapes[i].aspect)
+           << "," << fmt(sr.shapes[i].width) << "x" << fmt(sr.shapes[i].height) << ")";
+    }
+    if (first) return "NONE";
+    return ss.str();
+}
+
+static bool fixedPointResultBasicValid(const FixedPointFtResult &fp) {
+    return fp.final_attempt.valid_for_selection &&
+           fp.final_attempt.routing.unrouted_count == 0 &&
+           fp.final_attempt.placement.errors.empty() &&
+           fp.final_attempt.channels.errors.empty() &&
+           fp.final_attempt.routing.errors.empty() &&
+           fp.final_resize.errors.empty();
+}
+
+static bool betterSoftAspectChoice(const SoftAspectReshapeChoice &a,
+                                   const SoftAspectReshapeChoice &b) {
+    if (a.valid != b.valid) return a.valid > b.valid;
+    if (betterPlacementRoutingAttempt(a.fixed_point.final_attempt, b.fixed_point.final_attempt)) return true;
+    if (betterPlacementRoutingAttempt(b.fixed_point.final_attempt, a.fixed_point.final_attempt)) return false;
+    return a.selected_mode < b.selected_mode;
+}
+
+static SoftAspectReshapeChoice chooseSoftAspectReshapeAndFixedPointSingle(const InputData &d,
+                                                                          int resizeLoopCount) {
+    vector<SoftAspectReshapeChoice> choices;
+    for (const SoftAspectStrategyConfig &cfg : softAspectReshapeStrategies()) {
+        SoftAspectReshapeChoice ch;
+        ch.selected_mode = cfg.name;
+        ch.base_shapes = generateLegalBlockShapesWithSoftAspectStrategy(d, cfg);
+        ch.edge_placement = placeEdgeBlocksFirst(d, ch.base_shapes);
+        if (ch.base_shapes.errors.empty() && ch.edge_placement.errors.empty()) {
+            ch.fixed_point = chooseFixedPointFtResizeLoop(d, ch.base_shapes, ch.edge_placement, resizeLoopCount);
+            ch.valid = fixedPointResultBasicValid(ch.fixed_point);
+        } else {
+            ch.valid = false;
+        }
+
+        const PlacementRoutingAttempt &fa = ch.fixed_point.final_attempt;
+        stringstream ss;
+        ss << "SOFT_ASPECT_ATTEMPT," << ch.selected_mode
+           << ",valid=" << (ch.valid ? "YES" : "NO")
+           << ",shape_errors=" << ch.base_shapes.errors.size()
+           << ",edge_errors=" << ch.edge_placement.errors.size()
+           << ",placement=" << (fa.name.empty() ? string("N/A") : fa.name)
+           << ",overflow=" << fmt(fa.overflow_amount)
+           << ",overflow_channels=" << fa.overflow_channels
+           << ",unrouted=" << fa.routing.unrouted_count
+           << ",wirelength=" << fmt(fa.routing.total_estimated_wirelength)
+           << ",ft_budget=" << ch.fixed_point.final_resize.budget_total_ft_nets
+           << ",final_ft=" << ch.fixed_point.final_resize.final_total_ft_nets;
+        ch.attempt_summaries.push_back(ss.str());
+        ch.attempt_summaries.push_back("SOFT_ASPECT_SHAPES," + ch.selected_mode + "," + summarizeSoftAspectShapes(d, ch.base_shapes));
+        choices.push_back(ch);
+    }
+
+    int best = 0;
+    for (int i = 1; i < static_cast<int>(choices.size()); ++i) {
+        if (betterSoftAspectChoice(choices[i], choices[best])) best = i;
+    }
+
+    SoftAspectReshapeChoice chosen = choices[best];
+    vector<string> allSummaries;
+    allSummaries.push_back("SOFT_ASPECT_SELECTED: " + chosen.selected_mode);
+    for (const SoftAspectReshapeChoice &ch : choices) {
+        for (const string &s : ch.attempt_summaries) allSummaries.push_back(s);
+    }
+    chosen.attempt_summaries = allSummaries;
+    for (const string &s : chosen.attempt_summaries) {
+        chosen.fixed_point.final_attempt.placement.warnings.push_back(s);
+    }
+    return chosen;
+}
+
+
+static string softAspectChoiceQualityString(const SoftAspectReshapeChoice &ch) {
+    const PlacementRoutingAttempt &a = ch.fixed_point.final_attempt;
+    stringstream ss;
+    ss << ch.selected_mode
+       << " valid=" << (ch.valid ? "YES" : "NO")
+       << " unrouted=" << a.routing.unrouted_count
+       << " unrouted_nets=" << a.routing.unrouted_nets
+       << " overflow=" << fmt(a.overflow_amount)
+       << " overflow_channels=" << a.overflow_channels
+       << " wirelength=" << fmt(a.routing.total_estimated_wirelength)
+       << " placement=" << (a.name.empty() ? string("N/A") : a.name);
+    return ss.str();
+}
+
+static SoftAspectReshapeChoice chooseSoftAspectReshapeAndFixedPoint(const InputData &d,
+                                                                    int resizeLoopCount) {
+    bool oldFlag = g_enable_bottleneck_placement;
+
+    g_enable_bottleneck_placement = false;
+    SoftAspectReshapeChoice safe = chooseSoftAspectReshapeAndFixedPointSingle(d, resizeLoopCount);
+    safe.selected_mode = "SAFE_FALLBACK_NO_BOTTLENECK::" + safe.selected_mode;
+
+    g_enable_bottleneck_placement = true;
+    SoftAspectReshapeChoice bottleneck = chooseSoftAspectReshapeAndFixedPointSingle(d, resizeLoopCount);
+    bottleneck.selected_mode = "BOTTLENECK_AWARE::" + bottleneck.selected_mode;
+
+    g_enable_bottleneck_placement = oldFlag;
+
+    bool useBottleneck = betterSoftAspectChoice(bottleneck, safe);
+    SoftAspectReshapeChoice chosen = useBottleneck ? bottleneck : safe;
+
+    string safeQ = softAspectChoiceQualityString(safe);
+    string bottleneckQ = softAspectChoiceQualityString(bottleneck);
+    string selectedQ = softAspectChoiceQualityString(chosen);
+
+    vector<string> fallbackWarnings;
+    fallbackWarnings.push_back("SAFE_FALLBACK_SELECTOR: compared non-bottleneck baseline against bottleneck-aware placement; selected " + string(useBottleneck ? "BOTTLENECK_AWARE" : "SAFE_FALLBACK_NO_BOTTLENECK"));
+    fallbackWarnings.push_back("SAFE_FALLBACK_BASELINE_QUALITY: " + safeQ);
+    fallbackWarnings.push_back("SAFE_FALLBACK_BOTTLENECK_QUALITY: " + bottleneckQ);
+    fallbackWarnings.push_back("SAFE_FALLBACK_SELECTED_QUALITY: " + selectedQ);
+
+    for (const string &w : fallbackWarnings) {
+        chosen.attempt_summaries.insert(chosen.attempt_summaries.begin(), w);
+        chosen.fixed_point.final_attempt.placement.warnings.push_back(w);
+    }
+    return chosen;
+}
+
+static void printStep18CfgVerification(const string &filename,
                                       const InputData &d,
                                       const ShapeResult &sr,
                                       const EdgePlacementResult &er,
@@ -3898,11 +4599,11 @@ static void printStep16CfgVerification(const string &filename,
     double estimatedCost = outlineArea + d.alpha * rr.total_estimated_wirelength;
 
     cout << "==============================\n";
-    cout << "PROGRAM_VERSION: STEP_16_TWO_PASS_FT_RESIZE\n";
+    cout << "PROGRAM_VERSION: STEP_22_MULTI_CANDIDATE_PLACEMENT_SEARCH\n";
     cout << "INPUT_FILE: " << filename << "\n";
     cout << "CFG_OUTPUT_FILE: " << cfg.output_path << "\n";
     cout << "CFG_WRITTEN: " << (cfg.written ? "YES" : "NO") << "\n";
-    cout << "VERIFY_STEP: 16 - two-pass SOFT feedthrough size recalculation, then re-placement/re-routing\n";
+    cout << "VERIFY_STEP: 21 - safe fallback selector for bottleneck-aware placement + SOFT aspect reshaping + fixed-point FT resize loop + capacity routing candidates\n";
     cout << "BLOCK_COUNT: " << d.blocks.size()
          << "  SOFT: " << countType(d, "SOFT")
          << "  MACRO: " << countType(d, "MACRO")
@@ -4012,7 +4713,7 @@ static void printStep16CfgVerification(const string &filename,
 
 
     cout << "\nFT_SIZE_RECALCULATION_REPORT:\n";
-    cout << "  method: two-pass Pass-1 FT load -> resize SOFT blocks -> Pass-2 place/route/output\n";
+    cout << "  method: fixed-point FT resize loop with 2 iterations; each iteration sizes SOFT blocks from previous routing FT load, then re-places/re-routes\n";
     cout << "  pass1_total_ft_nets=" << fr.pass1_total_ft_nets
          << " budget_total_ft_nets=" << fr.budget_total_ft_nets
          << " final_total_ft_nets=" << fr.final_total_ft_nets
@@ -4119,7 +4820,7 @@ static void printStep16CfgVerification(const string &filename,
 int main(int argc, char **argv) {
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <input_case.csv> [more_case.csv ...]\n";
-        cerr << "This Step-16 version does two-pass SOFT feedthrough size recalculation, writes a .cfg file, then validates the generated .cfg format/geometry/routing.\n";
+        cerr << "This Step-22 version adds compact multi-candidate placement search, then writes a .cfg file and validates it.\n";
         return 1;
     }
 
@@ -4127,17 +4828,22 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         string filename = argv[i];
         InputData data = parseInputCsv(filename);
-        ShapeResult baseShapes = generateLegalBlockShapes(data);
-        EdgePlacementResult edgePlacement = placeEdgeBlocksFirst(data, baseShapes);
-        TwoPassFtResult twoPass = chooseTwoPassFtResizedPlacementAndRouting(data, baseShapes, edgePlacement);
-        ShapeResult finalShapes = twoPass.resized_shapes;
-        FullPlacementResult fullPlacement = twoPass.pass2.placement;
-        ChannelGenerationResult channels = twoPass.pass2.channels;
-        RoutingGenerationResult routing = twoPass.pass2.routing;
+        SoftAspectReshapeChoice choice = chooseSoftAspectReshapeAndFixedPoint(data, 2);
+        ShapeResult finalShapes = choice.fixed_point.resized_shapes;
+        EdgePlacementResult edgePlacement = choice.edge_placement;
+        FixedPointFtResult fixedPoint = choice.fixed_point;
+        FullPlacementResult fullPlacement = fixedPoint.final_attempt.placement;
+        if (!fullPlacement.strategy_name.empty()) {
+            fullPlacement.strategy_name = choice.selected_mode + " + " + fullPlacement.strategy_name;
+        } else {
+            fullPlacement.strategy_name = choice.selected_mode;
+        }
+        ChannelGenerationResult channels = fixedPoint.final_attempt.channels;
+        RoutingGenerationResult routing = fixedPoint.final_attempt.routing;
         CfgWriteResult cfg = writeCfgFile(filename, data, fullPlacement, channels, routing);
         CfgValidationResult cfgValidation = validateGeneratedCfgFile(cfg.output_path, data);
-        printStep16CfgVerification(filename, data, finalShapes, edgePlacement, fullPlacement, channels, routing, cfg, cfgValidation, twoPass.resize);
-        if (!data.errors.empty() || !finalShapes.errors.empty() || !edgePlacement.errors.empty() || !fullPlacement.errors.empty() || !channels.errors.empty() || !routing.errors.empty() || !cfg.errors.empty() || !cfg.written || !twoPass.resize.errors.empty() || !cfgValidation.overall_pass) anyFail = true;
+        printStep18CfgVerification(filename, data, finalShapes, edgePlacement, fullPlacement, channels, routing, cfg, cfgValidation, fixedPoint.final_resize);
+        if (!data.errors.empty() || !finalShapes.errors.empty() || !edgePlacement.errors.empty() || !fullPlacement.errors.empty() || !channels.errors.empty() || !routing.errors.empty() || !cfg.errors.empty() || !cfg.written || !fixedPoint.final_resize.errors.empty() || !cfgValidation.overall_pass) anyFail = true;
     }
     return anyFail ? 2 : 0;
 }
